@@ -1,3 +1,10 @@
+[0.1.27]
+* Proactive topup now maintains the API-key balance margin ahead of requests, allowing more parallel requests
+* Updated bundled routstrd to 0.4.9 and routstr-sdk to 0.4.4
+* Removed the cocod dependency; the container now generates its Nostr identity on first boot
+* Added npub names, manual/scheduled client refresh, and payment confirmation for receive to the CLI
+* Fixed a wallet-lock race when restarting the daemon with in-flight requests, and paid mint quotes now settle immediately
+
 [0.1.26]
 * Model allowlist enforcement is now disabled by default; set ROUTSTRD_AUTH_MODEL_ALLOWLIST=true to enable it
 * Added a nullable name field to npubs (POST/PATCH/GET), with automatic DB migration for existing installs
