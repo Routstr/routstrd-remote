@@ -1242,6 +1242,52 @@
             "creationDate": "Fri, 04 Sep 2026 08:20:32 GMT",
             "ts": "Fri, 04 Sep 2026 08:20:32 GMT",
             "publishState": "published"
+        },
+        "0.1.27": {
+            "manifest": {
+                "id": "io.routstr.routstrd-auth",
+                "title": "Routstrd Auth",
+                "author": "Routstr <hello@routstr.io>",
+                "description": "Auth proxy and daemon for the Routstr AI routing network",
+                "tagline": "Self-hosted Routstr node with bearer-token auth",
+                "version": "0.1.27",
+                "upstreamVersion": "0.1.27",
+                "healthCheckPath": "/health",
+                "httpPort": 8008,
+                "memoryLimit": 536870912,
+                "addons": {
+                    "localstorage": {
+                        "sqlite": {
+                            "paths": [
+                                "/app/data/routstr.db"
+                            ]
+                        }
+                    }
+                },
+                "manifestVersion": 2,
+                "website": "https://routstr.com",
+                "contactEmail": "team@routstr.com",
+                "iconUrl": "https://routstr.com/favicon.ico",
+                "packagerName": "Routstr",
+                "packagerUrl": "https://github.com/Routstr",
+                "minBoxVersion": "9.1.0",
+                "changelog": "* Proactive topup now maintains the API-key balance margin ahead of requests, allowing more parallel requests\n* Updated bundled routstrd to 0.4.9 and routstr-sdk to 0.4.4\n* Removed the cocod dependency; the container now generates its Nostr identity on first boot\n* Added npub names, manual/scheduled client refresh, and payment confirmation for receive to the CLI\n* Fixed a wallet-lock race when restarting the daemon with in-flight requests, and paid mint quotes now settle immediately\n",
+                "postInstallMessage": "Routstrd Auth is now installed.\n\nThe app exposes an OpenAI-compatible Routstr endpoint protected by bearer-token auth. Persistent wallet/config/database data is stored under Cloudron's app data directory and included in backups.\n\nIf you need admin-only client management endpoints, set `routstrd remote <url>` and `routstrd npubs register` to register the first admin npub.\n",
+                "tags": [
+                    "ai",
+                    "proxy",
+                    "nostr",
+                    "bitcoin",
+                    "openai"
+                ],
+                "mediaLinks": [
+                    "https://www.routstr.com/"
+                ],
+                "dockerImage": "ghcr.io/sh1ftred/routstrd-pro:20260910-183301-3113216f5"
+            },
+            "creationDate": "Thu, 10 Sep 2026 18:48:57 GMT",
+            "ts": "Thu, 10 Sep 2026 18:48:57 GMT",
+            "publishState": "published"
         }
     }
 }
