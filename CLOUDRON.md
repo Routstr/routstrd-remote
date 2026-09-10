@@ -57,7 +57,6 @@ The container exposes **one HTTP port** (the auth proxy), which Cloudron’s rev
 │                  /app/data (persistent, backed up)           │
 │                  - routstr.db                                │
 │                  - routstrd config / logs                    │
-│                  - cocod wallet data                         │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -118,11 +117,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
     && apt-get purge -y curl unzip && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------
-# 2. Install global npm/bun packages (routstrd + cocod wallet CLI)
+# 2. Install global npm/bun packages (routstrd)
 # ---------------------------------------------------------------
-RUN bun install --global @routstr/cocod routstrd \
-    && ln -s /root/.bun/bin/routstrd /usr/local/bin/routstrd \
-    && ln -s /root/.bun/bin/cocod /usr/local/bin/cocod
+RUN bun install --global routstrd \
+    && ln -s /root/.bun/bin/routstrd /usr/local/bin/routstrd
 
 # ---------------------------------------------------------------
 # 3. Prepare /app/code (Cloudron convention for application code)
@@ -185,7 +183,6 @@ chown -R cloudron:cloudron /app/data
 if [[ ! -f /app/data/.initialized ]]; then
     echo "==> First run detected. Setting up data directory..."
     # routstrd expects ROUTSTRD_DIR; we point it at /app/data/routstrd
-    # cocod expects COCOD_DIR; we point it at /app/data/cocod
     # Any bootstrap DB copy or config generation goes here
     touch /app/data/.initialized
     echo "==> Initialization complete."
@@ -208,7 +205,7 @@ exec /usr/bin/supervisord --configuration /etc/supervisor/supervisord.conf --nod
 [program:routstrd]
 priority=10
 directory=/app/data
-environment=HOME=/app/data,ROUTSTRD_DIR=/app/data/routstrd,COCOD_DIR=/app/data/cocod
+environment=HOME=/app/data,ROUTSTRD_DIR=/app/data/routstrd
 command=/usr/local/bin/routstrd --port 8009 --db-path /app/data/routstr.db
 user=cloudron
 autostart=true
@@ -225,7 +222,7 @@ stderr_logfile_maxbytes=0
 [program:auth]
 priority=20
 directory=/app/code
-environment=HOME=/app/data,ROUTSTRD_DIR=/app/data/routstrd,COCOD_DIR=/app/data/cocod,ROUTSTRD_UPSTREAM=http://localhost:8009,ROUTSTRD_DB_PATH=/app/data/routstrd/routstr.db,ROUTSTRD_AUTH_PORT=8008,ROUTSTRD_AUTH_HOST=0.0.0.0
+environment=HOME=/app/data,ROUTSTRD_DIR=/app/data/routstrd,ROUTSTRD_UPSTREAM=http://localhost:8009,ROUTSTRD_DB_PATH=/app/data/routstrd/routstr.db,ROUTSTRD_AUTH_PORT=8008,ROUTSTRD_AUTH_HOST=0.0.0.0
 command=/usr/local/bin/bun run /app/code/src/index.ts start
 user=cloudron
 autostart=true
@@ -253,7 +250,6 @@ Cloudron injects several useful environment variables at runtime. The ones most 
 
 **Recommended code change:** In `src/config.ts` (or wherever env vars are loaded), detect `CLOUDRON=1` and default:
 - `ROUTSTRD_DIR` → `/app/data/routstrd`
-- `COCOD_DIR` → `/app/data/cocod`
 - `ROUTSTRD_DB_PATH` → `/app/data/routstrd/routstr.db`
 - `ROUTSTRD_UPSTREAM` → `http://localhost:8009`
 - `ROUTSTRD_AUTH_PORT` → `8008`
@@ -272,7 +268,6 @@ This makes the Cloudron package work out of the box without requiring the user t
 | Auth proxy code | `/app/code` | Read-only, updated on app update. |
 | SQLite DB | `/app/data/routstr.db` | Persistent, WAL-aware backup via `localstorage.sqlite` addon. |
 | routstrd config / logs / pid | `/app/data` | `ROUTSTRD_DIR=/app/data/routstrd` ensures everything lands here. |
-| Wallet data (`cocod`) | `/app/data/cocod` | `COCOD_DIR=/app/data/cocod` ensures wallet data lands here. |
 | Temp files | `/tmp` | Ephemeral; cleaned periodically by Cloudron. |
 | Runtime state | `/run` | Ephemeral; survives restarts but not updates/rebuilds. |
 
@@ -399,7 +394,7 @@ If you want a stricter health check, ensure `/health` also verifies that the ups
 | File | Action |
 |------|--------|
 | `CloudronManifest.json` | **Create** — metadata, port 8008, `localstorage` addon with SQLite path. |
-| `Dockerfile.cloudron` | **Create** — based on `cloudron/base:5.0.0`, installs Bun, installs `routstrd`/`cocod`, copies app code, adds supervisor configs. |
+| `Dockerfile.cloudron` | **Create** — based on `cloudron/base:5.0.0`, installs Bun, installs `routstrd`, copies app code, adds supervisor configs. |
 | `cloudron/start.sh` | **Create** — init `/app/data`, chown, exec supervisord. |
 | `cloudron/supervisor/routstrd.conf` | **Create** — supervisord program for daemon on port 8009. |
 | `cloudron/supervisor/auth.conf` | **Create** — supervisord program for auth proxy on port 8008. |

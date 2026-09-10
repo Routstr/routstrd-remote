@@ -15,6 +15,7 @@ export type NpubRole = "admin" | "user";
 export interface NpubEntry {
   pubkey: string;
   npub: string;
+  name: string | null;
   createdAt: number;
   createdBy: string | null;
   source: string;
@@ -48,12 +49,21 @@ export class AuthStore {
         CREATE TABLE IF NOT EXISTS routstr_auth_npubs (
           pubkey TEXT PRIMARY KEY,
           npub TEXT NOT NULL UNIQUE,
+          name TEXT,
           created_at INTEGER NOT NULL,
           created_by TEXT,
           source TEXT NOT NULL DEFAULT 'api',
           role TEXT NOT NULL DEFAULT 'admin' CHECK (role IN ('admin', 'user'))
         )
       `);
+
+      // Migrate: add name column if it doesn't exist (older DBs won't have it).
+      const cols = this.db
+        .query("PRAGMA table_info(routstr_auth_npubs)")
+        .all() as Array<{ name: string }>;
+      if (!cols.some((c) => c.name === "name")) {
+        this.db.run("ALTER TABLE routstr_auth_npubs ADD COLUMN name TEXT");
+      }
 
       // Check if the legacy table exists and migrate its data.
       const legacyExists = this.db
@@ -62,8 +72,8 @@ export class AuthStore {
 
       if (legacyExists) {
         this.db.run(`
-          INSERT OR IGNORE INTO routstr_auth_npubs (pubkey, npub, created_at, created_by, source, role)
-          SELECT pubkey, npub, created_at, created_by, source, 'admin' FROM routstr_auth_admins
+          INSERT OR IGNORE INTO routstr_auth_npubs (pubkey, npub, name, created_at, created_by, source, role)
+          SELECT pubkey, npub, NULL, created_at, created_by, source, 'admin' FROM routstr_auth_admins
         `);
         this.db.run(`DROP TABLE routstr_auth_admins`);
       }
@@ -152,10 +162,11 @@ export class AuthStore {
     const where = role ? " WHERE role = ?" : "";
     const params = role ? [role] : [];
     const rows = this.db
-      .query(`SELECT pubkey, npub, created_at, created_by, source, role FROM routstr_auth_npubs${where} ORDER BY created_at ASC, npub ASC`)
+      .query(`SELECT pubkey, npub, name, created_at, created_by, source, role FROM routstr_auth_npubs${where} ORDER BY created_at ASC, npub ASC`)
       .all(...params) as Array<{
         pubkey: string;
         npub: string;
+        name: string | null;
         created_at: number;
         created_by: string | null;
         source: string;
@@ -165,6 +176,7 @@ export class AuthStore {
     return rows.map((row) => ({
       pubkey: row.pubkey,
       npub: row.npub,
+      name: row.name,
       createdAt: row.created_at,
       createdBy: row.created_by,
       source: row.source,
@@ -207,10 +219,11 @@ export class AuthStore {
 
   getNpubByPubkey(pubkey: string): NpubEntry | undefined {
     const row = this.db
-      .query("SELECT pubkey, npub, created_at, created_by, source, role FROM routstr_auth_npubs WHERE pubkey = ?")
+      .query("SELECT pubkey, npub, name, created_at, created_by, source, role FROM routstr_auth_npubs WHERE pubkey = ?")
       .get(pubkey.toLowerCase()) as {
         pubkey: string;
         npub: string;
+        name: string | null;
         created_at: number;
         created_by: string | null;
         source: string;
@@ -221,6 +234,7 @@ export class AuthStore {
     return {
       pubkey: row.pubkey,
       npub: row.npub,
+      name: row.name,
       createdAt: row.created_at,
       createdBy: row.created_by,
       source: row.source,
@@ -228,7 +242,7 @@ export class AuthStore {
     };
   }
 
-  addNpub(pubkey: string, role: NpubRole = "admin", createdBy: string | null = null): NpubEntry & { added: boolean } {
+  addNpub(pubkey: string, role: NpubRole = "admin", createdBy: string | null = null, name: string | null = null): NpubEntry & { added: boolean } {
     const normalizedPubkey = pubkey.toLowerCase();
     const npub = nip19.npubEncode(normalizedPubkey);
     const now = Math.floor(Date.now() / 1000);
@@ -236,17 +250,18 @@ export class AuthStore {
     const result = this.db
       .prepare(`
         INSERT OR IGNORE INTO routstr_auth_npubs
-          (pubkey, npub, created_at, created_by, source, role)
+          (pubkey, npub, name, created_at, created_by, source, role)
         VALUES
-          (?, ?, ?, ?, 'api', ?)
+          (?, ?, ?, ?, ?, 'api', ?)
       `)
-      .run(normalizedPubkey, npub, now, createdBy?.toLowerCase() ?? null, role);
+      .run(normalizedPubkey, npub, name, now, createdBy?.toLowerCase() ?? null, role);
 
     const row = this.db
-      .query("SELECT pubkey, npub, created_at, created_by, source, role FROM routstr_auth_npubs WHERE pubkey = ?")
+      .query("SELECT pubkey, npub, name, created_at, created_by, source, role FROM routstr_auth_npubs WHERE pubkey = ?")
       .get(normalizedPubkey) as {
         pubkey: string;
         npub: string;
+        name: string | null;
         created_at: number;
         created_by: string | null;
         source: string;
@@ -256,6 +271,7 @@ export class AuthStore {
     return {
       pubkey: row.pubkey,
       npub: row.npub,
+      name: row.name,
       createdAt: row.created_at,
       createdBy: row.created_by,
       source: row.source,
@@ -269,16 +285,44 @@ export class AuthStore {
     return this.addNpub(pubkey, "admin", createdBy);
   }
 
-  updateNpubRole(pubkey: string, role: NpubRole): NpubEntry | null {
+  /**
+   * Update role and/or name for an npub in a single transaction so a failure
+   * in one field can never leave a partial update behind.
+   */
+  updateNpub(
+    pubkey: string,
+    updates: { role?: NpubRole; name?: string | null },
+  ): NpubEntry | null {
     const normalizedPubkey = pubkey.toLowerCase();
     const existing = this.getNpubByPubkey(normalizedPubkey);
     if (!existing) return null;
 
-    this.db
-      .prepare("UPDATE routstr_auth_npubs SET role = ? WHERE pubkey = ?")
-      .run(role, normalizedPubkey);
+    const role = updates.role;
+    const name = updates.name;
+
+    this.db.transaction(() => {
+      if (role !== undefined) {
+        this.db
+          .prepare("UPDATE routstr_auth_npubs SET role = ? WHERE pubkey = ?")
+          .run(role, normalizedPubkey);
+      }
+
+      if (name !== undefined) {
+        this.db
+          .prepare("UPDATE routstr_auth_npubs SET name = ? WHERE pubkey = ?")
+          .run(name, normalizedPubkey);
+      }
+    })();
 
     return this.getNpubByPubkey(normalizedPubkey)!;
+  }
+
+  updateNpubRole(pubkey: string, role: NpubRole): NpubEntry | null {
+    return this.updateNpub(pubkey, { role });
+  }
+
+  updateNpubName(pubkey: string, name: string | null): NpubEntry | null {
+    return this.updateNpub(pubkey, { name });
   }
 
   removeNpub(pubkey: string): boolean {

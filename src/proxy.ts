@@ -72,7 +72,7 @@ export class AuthProxy {
 
   private parseNpubBody(
     raw: unknown,
-  ): { pubkey: string; role?: NpubRole } | Response {
+  ): { pubkey: string; role?: NpubRole; name?: string | null } | Response {
     if (raw === undefined || raw === null || (ArrayBuffer.isView(raw) && (raw as ArrayBufferView).byteLength === 0)) {
       return this.json({ error: "Request body is required. Provide { \"npub\": \"npub1...\" } or { \"pubkey\": \"<64-char hex>\" }." }, 400);
     }
@@ -97,7 +97,7 @@ export class AuthProxy {
     return this.extractNpub(raw);
   }
 
-  private extractNpub(parsed: unknown): { pubkey: string; role?: NpubRole } | Response {
+  private extractNpub(parsed: unknown): { pubkey: string; role?: NpubRole; name?: string | null } | Response {
     const value = typeof parsed === "string"
       ? parsed
       : parsed && typeof parsed === "object"
@@ -114,18 +114,35 @@ export class AuthProxy {
       return this.json({ error: "Invalid npub/pubkey. Use npub or 64-char hex pubkey." }, 400);
     }
 
-    const roleRaw = parsed && typeof parsed === "object"
-      ? (parsed as { role?: unknown }).role
-      : undefined;
-    if (roleRaw === undefined) {
-      return { pubkey };
+    const result: { pubkey: string; role?: NpubRole; name?: string | null } = { pubkey };
+
+    if (parsed && typeof parsed === "object") {
+      const roleRaw = (parsed as { role?: unknown }).role;
+      if (roleRaw !== undefined) {
+        if (roleRaw === "admin" || roleRaw === "user") {
+          result.role = roleRaw;
+        } else {
+          return this.json({ error: "Invalid role. Expected 'admin' or 'user'." }, 400);
+        }
+      }
+
+      const nameRaw = (parsed as { name?: unknown }).name;
+      if (nameRaw !== undefined) {
+        if (nameRaw === null) {
+          result.name = null;
+        } else if (typeof nameRaw === "string") {
+          const trimmed = nameRaw.trim();
+          if ([...trimmed].length > 64) {
+            return this.json({ error: "Invalid name. Maximum length is 64 characters." }, 400);
+          }
+          result.name = trimmed === "" ? null : trimmed;
+        } else {
+          return this.json({ error: "Invalid name. Expected a string or null." }, 400);
+        }
+      }
     }
 
-    if (roleRaw === "admin" || roleRaw === "user") {
-      return { pubkey, role: roleRaw };
-    }
-
-    return this.json({ error: "Invalid role. Expected 'admin' or 'user'." }, 400);
+    return result;
   }
 
   private async authenticateNpub(
@@ -425,9 +442,17 @@ export class AuthProxy {
   /** Handle /npubs management endpoints. */
   private async handleNpubs(req: Request, path: string): Promise<Response> {
     if (req.method === "GET" && path === "/npubs") {
+      const auth = await this.authenticateNpub(
+        req,
+        req.headers.get("authorization"),
+        undefined,
+        "user",
+      );
+      if (auth instanceof Response) return auth;
+
       const npubs = this.store.listNpubs();
       return this.json({
-        npubs: npubs.map((n) => ({ npub: n.npub, role: n.role })),
+        npubs: npubs.map((n) => ({ npub: n.npub, name: n.name, role: n.role })),
       });
     }
 
@@ -453,13 +478,23 @@ export class AuthProxy {
       // Bootstrap the very first registered npub as admin by default. After
       // bootstrap, default to user unless an admin explicitly sets role=admin.
       const role = parsed.role ?? (anyNpubs ? "user" : "admin");
-      const entry = this.store.addNpub(parsed.pubkey, role, createdBy);
+      const name = parsed.name ?? null;
+      const entry = this.store.addNpub(parsed.pubkey, role, createdBy, name);
+      if (!entry.added) {
+        return this.json({
+          error: "npub/pubkey already registered. Use PATCH /npubs to update role or name.",
+          npub: entry.npub,
+          pubkey: entry.pubkey,
+        }, 409);
+      }
+
       return this.json({
         npub: entry.npub,
         pubkey: entry.pubkey,
+        name: entry.name,
         role: entry.role,
         added: entry.added,
-      }, entry.added ? 201 : 200);
+      }, 201);
     }
 
     if (req.method === "DELETE" && (path === "/npubs" || path.startsWith("/npubs/"))) {
@@ -510,11 +545,14 @@ export class AuthProxy {
       const parsed = this.parseNpubBody(body);
       if (parsed instanceof Response) return parsed;
 
-      if (!parsed.role) {
-        return this.json({ error: "Missing required 'role' field. Expected 'admin' or 'user'." }, 400);
+      if (!parsed.role && parsed.name === undefined) {
+        return this.json({ error: "Missing required field. Provide 'role' and/or 'name' to update." }, 400);
       }
 
-      const updated = this.store.updateNpubRole(parsed.pubkey, parsed.role);
+      const updated = this.store.updateNpub(parsed.pubkey, {
+        role: parsed.role,
+        name: parsed.name,
+      });
       if (!updated) {
         return this.json({ error: "npub/pubkey not found." }, 404);
       }
@@ -522,6 +560,7 @@ export class AuthProxy {
       return this.json({
         npub: updated.npub,
         pubkey: updated.pubkey,
+        name: updated.name,
         role: updated.role,
       });
     }
@@ -591,14 +630,16 @@ export class AuthProxy {
         return this.json({ error: "Invalid API key." }, 401);
       }
 
-      // Buffer the body for POST requests so we can enforce the model
-      // allowlist. Bearer requests previously streamed the body directly;
-      // the tradeoff is a small latency cost for the buffer, but it's
-      // necessary to inspect the `model` field.
-      const body =
-        req.method === "POST" || req.method === "PUT" || req.method === "PATCH"
-          ? new Uint8Array(await req.arrayBuffer())
-          : undefined;
+      // Buffer the body only when model allowlist enforcement is enabled,
+      // so we can inspect the `model` field. When disabled, keep the
+      // original streaming body to avoid the buffering latency.
+      let body: Uint8Array | undefined;
+      if (
+        this.config.modelAllowlistEnabled &&
+        (req.method === "POST" || req.method === "PUT" || req.method === "PATCH")
+      ) {
+        body = new Uint8Array(await req.arrayBuffer());
+      }
 
       const blocked = this.checkModelAllowlist(body, req.method);
       if (blocked) return blocked;

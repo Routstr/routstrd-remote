@@ -82,9 +82,18 @@ function parseAdminPubkeys(raw: string): {
   return { pubkeys: [...pubkeys], invalid };
 }
 
-/** Whether model allowlist enforcement is enabled (default: true). Set ROUTSTRD_AUTH_MODEL_ALLOWLIST=false to disable. */
-export const MODEL_ALLOWLIST_ENABLED =
-  process.env.ROUTSTRD_AUTH_MODEL_ALLOWLIST !== "false";
+/**
+ * Whether model allowlist enforcement is enabled.
+ *
+ * Disabled by default. Set ROUTSTRD_AUTH_MODEL_ALLOWLIST=true to enable.
+ */
+export function isModelAllowlistEnabled(
+  envValue: string | undefined = process.env.ROUTSTRD_AUTH_MODEL_ALLOWLIST,
+): boolean {
+  return envValue === "true";
+}
+
+export const MODEL_ALLOWLIST_ENABLED = isModelAllowlistEnabled();
 
 export interface AuthProxyConfig {
   /** Public port to listen on. */

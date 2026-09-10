@@ -1,16 +1,9 @@
 #!/bin/sh
 set -e
 
-# Ensure data directories exist for routstrd and cocod
-export COCOD_DIR="${COCOD_DIR:-/data/cocod}"
-mkdir -p "$COCOD_DIR"
-mkdir -p /data/logs
-
-# Attempt to initialize cocod.
-# This is idempotent; if already initialized it typically exits non-zero
-# with "already initialized", which we safely ignore.
-echo "Ensuring cocod wallet is initialized..."
-cocod init </dev/null 2>&1 || true
+# Ensure data directories exist for routstrd
+export ROUTSTRD_DIR="${ROUTSTRD_DIR:-/data/routstrd}"
+mkdir -p "$ROUTSTRD_DIR" /data/logs
 
 # routstrd stays local to the container. routstrd-auth is the public service.
 ROUTSTRD_PORT="${ROUTSTRD_PORT:-${PORT:-8008}}"
@@ -21,6 +14,44 @@ ROUTSTRD_UPSTREAM="${ROUTSTRD_UPSTREAM:-http://localhost:${ROUTSTRD_PORT}}"
 # bootstraps the first admin via unauthenticated POST /npubs (or sets the var).
 ROUTSTRD_AUTH_ADMIN_NPUBS="${ROUTSTRD_AUTH_ADMIN_NPUBS:-}"
 export ROUTSTRD_AUTH_PORT ROUTSTRD_AUTH_HOST ROUTSTRD_UPSTREAM ROUTSTRD_AUTH_ADMIN_NPUBS
+
+# Ensure routstrd's config.json has authUrl pointing to the auth proxy and a Nostr identity.
+ROUTSTRD_CONFIG="${ROUTSTRD_DIR}/config.json"
+AUTH_URL="http://localhost:${ROUTSTRD_AUTH_PORT}"
+echo "Configuring authUrl (${AUTH_URL}) and Nostr identity in ${ROUTSTRD_CONFIG}..."
+bun -e '
+  let nostrTools;
+  try {
+    nostrTools = await import("nostr-tools");
+  } catch {
+    try {
+      nostrTools = await import("/app/code/node_modules/nostr-tools");
+    } catch {
+      nostrTools = await import("/usr/local/bun/install/global/node_modules/routstrd/node_modules/nostr-tools");
+    }
+  }
+  const { generateSecretKey, nip19, getPublicKey } = nostrTools;
+  const configPath = process.argv[1];
+  const authUrl = process.argv[2];
+
+  let config = {};
+  try {
+    if (await Bun.file(configPath).exists()) {
+      config = JSON.parse(await Bun.file(configPath).text());
+    }
+  } catch {}
+
+  config.authUrl = authUrl;
+
+  if (!config.nsec) {
+    const sk = generateSecretKey();
+    config.nsec = nip19.nsecEncode(sk);
+    const npub = nip19.npubEncode(getPublicKey(sk));
+    console.log(`Generated container Nostr identity: ${npub}`);
+  }
+
+  await Bun.write(configPath, JSON.stringify(config, null, 2) + "\n");
+' "${ROUTSTRD_CONFIG}" "${AUTH_URL}"
 
 _term() {
   echo "Shutting down..."

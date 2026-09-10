@@ -26,8 +26,8 @@ All values have sensible defaults and can be overridden via environment variable
 | `ROUTSTRD_AUTH_HOST` | `0.0.0.0` | Bind host |
 | `ROUTSTRD_UPSTREAM` | `http://localhost:8009` | Upstream routstrd URL |
 | `ROUTSTRD_DB_PATH` | `~/.routstrd/routstr.db` | Shared SQLite DB |
+| `ROUTSTRD_AUTH_MODEL_ALLOWLIST` | `false` | Enable model allowlist enforcement (`true`/`false`) |
 | `ROUTSTRD_DIR` | `~/.routstrd` | Base config directory |
-| `COCOD_DIR` | `~/.cocod` | Wallet data directory |
 
 ## Cloudron
 
@@ -197,10 +197,11 @@ The helper creates `Authorization: Nostr <base64-event>` headers whose signed ev
 
 - **Public endpoints** (health, models, balance, etc.) — forwarded immediately, no token needed.
 - **Protected endpoints** — require a valid `Bearer` token that exists in the shared DB.
-- **Admin npubs** — stored in the shared `routstr.db` table `routstr_auth_admins`. Env-configured admins are bootstrapped into that table at startup.
-- **List admins** — `GET /npubs` returns `{ "npubs": [...] }` with the configured admin npubs.
-- **Add admins** — `POST /npubs` with `{ "npub": "npub1..." }` or `{ "pubkey": "<64-char hex>" }`. If no admins are configured yet, this first add is unauthenticated; after that it requires NIP-98 auth from an existing admin.
-- **Remove admins** — `DELETE /npubs/<npub-or-pubkey>` (or `DELETE /npubs?npub=...`) requires NIP-98 auth from an existing admin.
+- **Registered npubs** — stored in the shared `routstr.db` table `routstr_auth_npubs`. Env-configured admins are bootstrapped into that table at startup.
+- **List npubs** — `GET /npubs` returns `{ "npubs": [...] }` with each npub's `npub`, `name`, and `role`. Requires NIP-98 auth from a registered npub.
+- **Add npubs** — `POST /npubs` with `{ "npub": "npub1..." }` or `{ "pubkey": "<64-char hex>" }`, optionally `{ "role": "user", "name": "Alice" }`. If no npubs are configured yet, this first add is unauthenticated; after that it requires NIP-98 auth from an existing admin. Duplicate npubs return `409`; use `PATCH /npubs` to update an existing entry.
+- **Update npubs** — `PATCH /npubs` with `{ "npub": "npub1..." }` or `{ "pubkey": "<64-char hex>" }` plus `role` and/or `name`. Requires NIP-98 auth from an existing admin. Set `name` to `null` to clear it.
+- **Remove npubs** — `DELETE /npubs/<npub-or-pubkey>` (or `DELETE /npubs?npub=...`) requires NIP-98 auth from an existing admin.
 - **Forwarded headers** — the proxy strips `Authorization` and injects `x-routstr-client-id` so the daemon knows which client made the request.
 
 ## License

@@ -3,8 +3,9 @@ import { Database } from "bun:sqlite";
 import { join } from "path";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
+import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools";
 import { AuthProxy, type AuthProxyConfig } from "./proxy";
-import type { AuthStore } from "./store";
+import { AuthStore } from "./store";
 
 /**
  * Tests for model allowlist enforcement (AUTH-001).
@@ -84,6 +85,50 @@ const TEST_CLIENT = {
   lastUsed: null,
 };
 
+// ─── NIP-98 helpers ──────────────────────────────────────────────────────────
+
+function bytesToHex(bytes: Uint8Array): string {
+  return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function sha256Hex(data: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return bytesToHex(new Uint8Array(digest));
+}
+
+function base64UrlEncode(input: string): string {
+  const bytes = new TextEncoder().encode(input);
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+async function nip98Authorization(
+  secretKey: Uint8Array,
+  req: Request,
+  body?: Uint8Array,
+): Promise<string> {
+  const tags: string[][] = [
+    ["u", new URL(req.url).toString()],
+    ["method", req.method],
+  ];
+  if (body && body.byteLength > 0) {
+    tags.push(["payload", await sha256Hex(body)]);
+  }
+
+  const event = finalizeEvent(
+    {
+      kind: 27235,
+      created_at: Math.floor(Date.now() / 1000),
+      tags,
+      content: "",
+    },
+    secretKey,
+  );
+
+  return `Nostr ${base64UrlEncode(JSON.stringify(event))}`;
+}
+
 // ─── Mock upstream ────────────────────────────────────────────────────────────
 
 /** A mock fetch that records calls and returns a generic 200 response. */
@@ -117,6 +162,280 @@ function mockFetchUpstream() {
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
+
+describe("npub name endpoints", () => {
+  let tmp: { dbPath: string; cleanup: () => void };
+  let proxy: AuthProxy;
+
+  beforeEach(() => {
+    tmp = createTmpDb();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+  });
+
+  afterEach(() => {
+    proxy.close();
+    tmp.cleanup();
+  });
+
+  it("POST /npubs trims and stores a name on bootstrap", async () => {
+    const pubkey = "ef".repeat(32);
+    const req = new Request("http://localhost:8008/npubs", {
+      method: "POST",
+      body: JSON.stringify({ pubkey, name: "  Alice  " }),
+    });
+
+    const res = await proxy.handle(req);
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.name).toBe("Alice");
+    expect(body.role).toBe("admin");
+  });
+
+  it("POST /npubs rejects a non-string name with 400", async () => {
+    const req = new Request("http://localhost:8008/npubs", {
+      method: "POST",
+      body: JSON.stringify({ pubkey: "ef".repeat(32), name: 42 }),
+    });
+
+    const res = await proxy.handle(req);
+    expect(res.status).toBe(400);
+  });
+
+  it("POST /npubs rejects a name over 64 characters with 400", async () => {
+    const req = new Request("http://localhost:8008/npubs", {
+      method: "POST",
+      body: JSON.stringify({ pubkey: "ef".repeat(32), name: "x".repeat(65) }),
+    });
+
+    const res = await proxy.handle(req);
+    expect(res.status).toBe(400);
+  });
+
+  it("GET /npubs requires NIP-98 auth", async () => {
+    const req = new Request("http://localhost:8008/npubs");
+    const res = await proxy.handle(req);
+    expect(res.status).toBe(401);
+  });
+
+  it("GET /npubs returns names for an authenticated npub", async () => {
+    const secretKey = generateSecretKey();
+    const pubkey = getPublicKey(secretKey);
+    const store = new AuthStore(tmp.dbPath);
+    store.addNpub(pubkey, "admin", null, "Alice");
+    store.close();
+
+    proxy.close();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    const req = new Request("http://localhost:8008/npubs");
+    const auth = await nip98Authorization(secretKey, req);
+    const res = await proxy.handle(
+      new Request(req.url, { headers: { Authorization: auth } }),
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.npubs).toHaveLength(1);
+    expect(body.npubs[0].name).toBe("Alice");
+  });
+
+  it("PATCH /npubs updates name only", async () => {
+    const secretKey = generateSecretKey();
+    const pubkey = getPublicKey(secretKey);
+    const store = new AuthStore(tmp.dbPath);
+    store.addNpub(pubkey, "admin", null, "Alice");
+    store.close();
+
+    proxy.close();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    const payload = new TextEncoder().encode(
+      JSON.stringify({ pubkey, name: "Bob" }),
+    );
+    const req = new Request("http://localhost:8008/npubs", {
+      method: "PATCH",
+      body: payload,
+    });
+    const auth = await nip98Authorization(secretKey, req, payload);
+    const res = await proxy.handle(
+      new Request(req.url, { method: "PATCH", headers: { Authorization: auth }, body: payload }),
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.name).toBe("Bob");
+    expect(body.role).toBe("admin");
+  });
+
+  it("PATCH /npubs clears a name with null", async () => {
+    const secretKey = generateSecretKey();
+    const pubkey = getPublicKey(secretKey);
+    const store = new AuthStore(tmp.dbPath);
+    store.addNpub(pubkey, "admin", null, "Alice");
+    store.close();
+
+    proxy.close();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    const payload = new TextEncoder().encode(
+      JSON.stringify({ pubkey, name: null }),
+    );
+    const req = new Request("http://localhost:8008/npubs", {
+      method: "PATCH",
+      body: payload,
+    });
+    const auth = await nip98Authorization(secretKey, req, payload);
+    const res = await proxy.handle(
+      new Request(req.url, { method: "PATCH", headers: { Authorization: auth }, body: payload }),
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.name).toBeNull();
+  });
+
+  it("POST /npubs returns 409 for a duplicate npub", async () => {
+    const secretKey = generateSecretKey();
+    const adminPubkey = getPublicKey(secretKey);
+    const targetPubkey = "ef".repeat(32);
+    const store = new AuthStore(tmp.dbPath);
+    store.addNpub(adminPubkey, "admin", null, "Admin");
+    store.addNpub(targetPubkey, "user", adminPubkey);
+    store.close();
+
+    proxy.close();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    const payload = new TextEncoder().encode(
+      JSON.stringify({ pubkey: targetPubkey, name: "Duplicate" }),
+    );
+    const req = new Request("http://localhost:8008/npubs", {
+      method: "POST",
+      body: payload,
+    });
+    const auth = await nip98Authorization(secretKey, req, payload);
+    const res = await proxy.handle(
+      new Request(req.url, { method: "POST", headers: { Authorization: auth }, body: payload }),
+    );
+
+    expect(res.status).toBe(409);
+  });
+
+  it("POST /npubs accepts a 64-character name", async () => {
+    const req = new Request("http://localhost:8008/npubs", {
+      method: "POST",
+      body: JSON.stringify({ pubkey: "ef".repeat(32), name: "x".repeat(64) }),
+    });
+
+    const res = await proxy.handle(req);
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.name).toBe("x".repeat(64));
+  });
+
+  it("GET /npubs is accessible to a registered user", async () => {
+    const secretKey = generateSecretKey();
+    const pubkey = getPublicKey(secretKey);
+    const store = new AuthStore(tmp.dbPath);
+    store.addNpub(pubkey, "user", null, "Carol");
+    store.close();
+
+    proxy.close();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    const req = new Request("http://localhost:8008/npubs");
+    const auth = await nip98Authorization(secretKey, req);
+    const res = await proxy.handle(
+      new Request(req.url, { headers: { Authorization: auth } }),
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.npubs).toHaveLength(1);
+    expect(body.npubs[0].name).toBe("Carol");
+    expect(body.npubs[0].role).toBe("user");
+  });
+
+  it("PATCH /npubs is rejected for a registered user (403)", async () => {
+    const secretKey = generateSecretKey();
+    const pubkey = getPublicKey(secretKey);
+    const store = new AuthStore(tmp.dbPath);
+    store.addNpub(pubkey, "user", null, "Carol");
+    store.close();
+
+    proxy.close();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    const payload = new TextEncoder().encode(
+      JSON.stringify({ pubkey, name: "Hacker" }),
+    );
+    const req = new Request("http://localhost:8008/npubs", {
+      method: "PATCH",
+      body: payload,
+    });
+    const auth = await nip98Authorization(secretKey, req, payload);
+    const res = await proxy.handle(
+      new Request(req.url, { method: "PATCH", headers: { Authorization: auth }, body: payload }),
+    );
+
+    expect(res.status).toBe(403);
+  });
+
+  it("PATCH /npubs updates role and name in one request", async () => {
+    const secretKey = generateSecretKey();
+    const pubkey = getPublicKey(secretKey);
+    const store = new AuthStore(tmp.dbPath);
+    store.addNpub(pubkey, "admin", null, "Alice");
+    store.close();
+
+    proxy.close();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    const payload = new TextEncoder().encode(
+      JSON.stringify({ pubkey, role: "user", name: "Bob" }),
+    );
+    const req = new Request("http://localhost:8008/npubs", {
+      method: "PATCH",
+      body: payload,
+    });
+    const auth = await nip98Authorization(secretKey, req, payload);
+    const res = await proxy.handle(
+      new Request(req.url, { method: "PATCH", headers: { Authorization: auth }, body: payload }),
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.role).toBe("user");
+    expect(body.name).toBe("Bob");
+  });
+
+  it("PATCH /npubs clears a name with a whitespace-only value", async () => {
+    const secretKey = generateSecretKey();
+    const pubkey = getPublicKey(secretKey);
+    const store = new AuthStore(tmp.dbPath);
+    store.addNpub(pubkey, "admin", null, "Alice");
+    store.close();
+
+    proxy.close();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    const payload = new TextEncoder().encode(
+      JSON.stringify({ pubkey, name: "   " }),
+    );
+    const req = new Request("http://localhost:8008/npubs", {
+      method: "PATCH",
+      body: payload,
+    });
+    const auth = await nip98Authorization(secretKey, req, payload);
+    const res = await proxy.handle(
+      new Request(req.url, { method: "PATCH", headers: { Authorization: auth }, body: payload }),
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.name).toBeNull();
+  });
+});
 
 describe("Model Allowlist Enforcement (AUTH-001)", () => {
   let tmp: { dbPath: string; cleanup: () => void };

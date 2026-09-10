@@ -13,7 +13,6 @@ ARG BUN_VERSION=1.2.22
 ARG BUN_TARGET=bun-linux-x64-baseline
 ENV BUN_INSTALL=/usr/local/bun
 ENV ROUTSTRD_DIR=/app/data/routstrd
-ENV COCOD_DIR=/app/data/cocod
 ENV PATH="/usr/local/bun/bin:/usr/local/bin:${PATH}"
 
 RUN apt-get update \
@@ -29,12 +28,11 @@ RUN apt-get update \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
-# Install routstrd daemon + cocod wallet CLI globally. The global install lives
+# Install routstrd daemon globally. The global install lives
 # under /usr/local/bun, not /root, so supervised processes running as cloudron
 # can execute the binaries on Cloudron's read-only root filesystem.
-RUN bun install --global @routstr/cocod routstrd \
+RUN bun install --global routstrd \
     && ln -sf /usr/local/bun/bin/routstrd /usr/local/bin/routstrd \
-    && ln -sf /usr/local/bun/bin/cocod /usr/local/bin/cocod \
     && test -f /usr/local/bun/install/global/node_modules/routstrd/dist/daemon/index.js
 
 # Cloudron convention: immutable app code in /app/code, persistent data mounted
