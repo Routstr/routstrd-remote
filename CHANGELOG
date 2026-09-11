@@ -1,3 +1,7 @@
+[0.1.28]
+* Fixed a bug that truncated the list of provider announcements
+* Added npub names to the TUI
+
 [0.1.27]
 * Proactive topup now maintains the API-key balance margin ahead of requests, allowing more parallel requests
 * Updated bundled routstrd to 0.4.9 and routstr-sdk to 0.4.4
