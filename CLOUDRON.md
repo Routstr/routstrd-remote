@@ -85,7 +85,7 @@ This file sits **next to** the Dockerfile (it is **not** baked into the image). 
   "addons": {
     "localstorage": {
       "sqlite": {
-        "paths": ["/app/data/routstr.db"]
+        "paths": ["/app/data/routstrd/routstr.db"]
       }
     }
   },
@@ -206,7 +206,7 @@ exec /usr/bin/supervisord --configuration /etc/supervisor/supervisord.conf --nod
 priority=10
 directory=/app/data
 environment=HOME=/app/data,ROUTSTRD_DIR=/app/data/routstrd
-command=/usr/local/bin/routstrd --port 8009 --db-path /app/data/routstr.db
+command=/usr/local/bin/routstrd --port 8009 --db-path /app/data/routstrd/routstr.db
 user=cloudron
 autostart=true
 autorestart=true
@@ -266,7 +266,7 @@ This makes the Cloudron package work out of the box without requiring the user t
 | Purpose | Path | Notes |
 |---------|------|-------|
 | Auth proxy code | `/app/code` | Read-only, updated on app update. |
-| SQLite DB | `/app/data/routstr.db` | Persistent, WAL-aware backup via `localstorage.sqlite` addon. |
+| SQLite DB | `/app/data/routstrd/routstr.db` | Persistent, WAL-aware backup via `localstorage.sqlite` addon. |
 | routstrd config / logs / pid | `/app/data` | `ROUTSTRD_DIR=/app/data/routstrd` ensures everything lands here. |
 | Temp files | `/tmp` | Ephemeral; cleaned periodically by Cloudron. |
 | Runtime state | `/run` | Ephemeral; survives restarts but not updates/rebuilds. |
@@ -278,7 +278,7 @@ Because SQLite uses WAL mode, a naive filesystem copy can be inconsistent. By de
 ```json
 "localstorage": {
   "sqlite": {
-    "paths": ["/app/data/routstr.db"]
+    "paths": ["/app/data/routstrd/routstr.db"]
   }
 }
 ```

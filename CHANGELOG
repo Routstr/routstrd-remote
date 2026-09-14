@@ -1,3 +1,6 @@
+[Unreleased]
+* Fixed the Cloudron `localstorage.sqlite` addon path to point at the real database (`/app/data/routstrd/routstr.db`), so backups take a WAL-aware consistent snapshot instead of a raw filesystem copy
+
 [0.1.28]
 * Fixed a bug that truncated the list of provider announcements
 * Added npub names to the TUI

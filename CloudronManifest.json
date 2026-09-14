@@ -13,7 +13,7 @@
     "localstorage": {
       "sqlite": {
         "paths": [
-          "/app/data/routstr.db"
+          "/app/data/routstrd/routstr.db"
         ]
       }
     }
