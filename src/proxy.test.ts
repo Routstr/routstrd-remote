@@ -133,7 +133,7 @@ async function nip98Authorization(
 
 /** A mock fetch that records calls and returns a generic 200 response. */
 function mockFetchUpstream() {
-  const calls: { url: string; method: string; body?: string }[] = [];
+  const calls: { url: string; method: string; body?: string; headers: Headers }[] = [];
   const originalFetch = globalThis.fetch;
 
   const mocked = mock(async (input: string | URL | Request, init?: RequestInit) => {
@@ -147,7 +147,7 @@ function mockFetchUpstream() {
     } else if (body instanceof ReadableStream) {
       bodyStr = "[stream]";
     }
-    calls.push({ url, method: init?.method ?? "GET", body: bodyStr });
+    calls.push({ url, method: init?.method ?? "GET", body: bodyStr, headers: new Headers(init?.headers) });
     return new Response(JSON.stringify({ ok: true }), {
       status: 200,
       headers: { "Content-Type": "application/json" },
@@ -453,6 +453,82 @@ describe("Model Allowlist Enforcement (AUTH-001)", () => {
     proxy?.close();
     upstream.restore();
     tmp.cleanup();
+  });
+
+  describe("Anthropic x-api-key authentication", () => {
+    function request(headers: Record<string, string>, model = TEST_MODELS[1]!) {
+      return new Request("http://localhost:8008/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...headers },
+        body: JSON.stringify({ model, messages: [], max_tokens: 16 }),
+      });
+    }
+
+    it("validates and forwards a mixed-case x-api-key with the original body", async () => {
+      proxy = new AuthProxy(makeConfig(tmp.dbPath));
+      const res = await proxy.handle(request({ "X-API-Key": TEST_API_KEY }));
+      expect(res.status).toBe(200);
+      expect(upstream.calls).toHaveLength(1);
+      expect(upstream.calls[0]!.headers.get("x-api-key")).toBe(TEST_API_KEY);
+      expect(upstream.calls[0]!.url).toBe("http://localhost:9999/v1/messages");
+      expect(JSON.parse(upstream.calls[0]!.body!).model).toBe(TEST_MODELS[1]);
+    });
+
+    it("forwards without buffering when the allowlist is disabled", async () => {
+      proxy = new AuthProxy(makeConfig(tmp.dbPath, { modelAllowlistEnabled: false }));
+      expect((await proxy.handle(request({ "x-api-key": TEST_API_KEY }))).status).toBe(200);
+      expect(upstream.calls[0]!.body).toBe("[stream]");
+    });
+
+    it("rejects invalid, empty and missing keys", async () => {
+      proxy = new AuthProxy(makeConfig(tmp.dbPath));
+      for (const headers of [{ "x-api-key": "invalid" }, { "x-api-key": "" }, {}]) {
+        expect((await proxy.handle(request(headers))).status).toBe(401);
+      }
+      expect(upstream.calls).toHaveLength(0);
+    });
+
+    it("enforces the same model allowlist", async () => {
+      proxy = new AuthProxy(makeConfig(tmp.dbPath));
+      expect((await proxy.handle(request({ "x-api-key": TEST_API_KEY }, "blocked-model"))).status).toBe(403);
+      expect(upstream.calls).toHaveLength(0);
+    });
+
+    it("does not grant wallet, daemon-control or client-management access", async () => {
+      proxy = new AuthProxy(makeConfig(tmp.dbPath));
+      for (const path of ["/wallet/balance", "/wallet/send/cashu", "/stop", "/providers", "/clients/add"]) {
+        const res = await proxy.handle(new Request(`http://localhost:8008${path}`, {
+          method: "POST", headers: { "x-api-key": TEST_API_KEY }, body: "{}",
+        }));
+        expect([401, 403]).toContain(res.status);
+      }
+      expect(upstream.calls).toHaveLength(0);
+    });
+
+    it("never falls back from an explicit invalid Authorization header", async () => {
+      proxy = new AuthProxy(makeConfig(tmp.dbPath));
+      for (const authorization of ["Bearer invalid", "Basic invalid", "Nostr invalid", ""]) {
+        expect((await proxy.handle(request({ Authorization: authorization, "x-api-key": TEST_API_KEY }))).status).toBe(401);
+      }
+      expect(upstream.calls).toHaveLength(0);
+    });
+
+    it("prefers valid Bearer auth over an invalid x-api-key", async () => {
+      proxy = new AuthProxy(makeConfig(tmp.dbPath));
+      expect((await proxy.handle(request({ Authorization: `Bearer ${TEST_API_KEY}`, "x-api-key": "invalid" }))).status).toBe(200);
+    });
+
+    it("allows Anthropic headers in browser preflights without forwarding", async () => {
+      proxy = new AuthProxy(makeConfig(tmp.dbPath));
+      const res = await proxy.handle(new Request("http://localhost:8008/v1/messages", {
+        method: "OPTIONS",
+        headers: { "Access-Control-Request-Headers": "x-api-key,anthropic-version,anthropic-beta" },
+      }));
+      expect(res.status).toBe(204);
+      const allowed = res.headers.get("Access-Control-Allow-Headers")!.toLowerCase();
+      for (const header of ["x-api-key", "anthropic-version", "anthropic-beta"]) expect(allowed).toContain(header);
+      expect(upstream.calls).toHaveLength(0);
+    });
   });
 
   // --- Bearer path tests ---
