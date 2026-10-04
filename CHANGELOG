@@ -1,3 +1,6 @@
+[Unreleased]
+* Fixed the Cloudron `localstorage.sqlite` addon path to point at the real database (`/app/data/routstrd/routstr.db`), so backups take a WAL-aware consistent snapshot instead of a raw filesystem copy
+
 [0.1.29]
 * Money safety: paid mint quotes that were paid but never issued are now recovered instead of being lost
 * Mint recovery is gated per mint, and mints are probed for reachability before they are used
