@@ -196,7 +196,7 @@ The helper creates `Authorization: Nostr <base64-event>` headers whose signed ev
 ## Auth behaviour
 
 - **Public endpoints** (health, models, balance, etc.) — forwarded immediately, no token needed.
-- **Protected endpoints** — require a valid `Bearer` token that exists in the shared DB.
+- **Forwarded endpoints** — client API keys (`Bearer` or `x-api-key`) are limited to supported inference routes. Registered npubs retain signed daemon access, while wallet sends and provider API-key listing/deletion require an admin npub.
 - **Registered npubs** — stored in the shared `routstr.db` table `routstr_auth_npubs`. Env-configured admins are bootstrapped into that table at startup.
 - **List npubs** — `GET /npubs` returns `{ "npubs": [...] }` with each npub's `npub`, `name`, and `role`. Requires NIP-98 auth from a registered npub.
 - **Add npubs** — `POST /npubs` with `{ "npub": "npub1..." }` or `{ "pubkey": "<64-char hex>" }`, optionally `{ "role": "user", "name": "Alice" }`. If no npubs are configured yet, this first add is unauthenticated; after that it requires NIP-98 auth from an existing admin. Duplicate npubs return `409`; use `PATCH /npubs` to update an existing entry.

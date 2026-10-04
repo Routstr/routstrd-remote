@@ -772,3 +772,179 @@ describe("Model Allowlist Enforcement (AUTH-001)", () => {
     });
   });
 });
+
+describe("daemon route capability boundary", () => {
+  const inferenceFamilies = [
+    "chat/completions",
+    "completions",
+    "responses",
+    "messages",
+    "messages/count_tokens",
+    "embeddings",
+    "systemone",
+  ];
+  let tmp: { dbPath: string; cleanup: () => void };
+  let upstream: ReturnType<typeof mockFetchUpstream>;
+  let proxy: AuthProxy;
+
+  beforeEach(() => {
+    tmp = createTmpDb();
+    setClients(tmp.dbPath, [TEST_CLIENT]);
+    upstream = mockFetchUpstream();
+    proxy = new AuthProxy(
+      makeConfig(tmp.dbPath, { modelAllowlistEnabled: false }),
+    );
+  });
+
+  afterEach(() => {
+    proxy.close();
+    upstream.restore();
+    tmp.cleanup();
+  });
+
+  function registerNpub(role: "admin" | "user"): Uint8Array {
+    const secretKey = generateSecretKey();
+    const store = new AuthStore(tmp.dbPath);
+    store.addNpub(getPublicKey(secretKey), role, null);
+    store.close();
+    return secretKey;
+  }
+
+  async function signedRequest(
+    secretKey: Uint8Array,
+    method: string,
+    path: string,
+    bodyText?: string,
+  ): Promise<Request> {
+    const body = bodyText === undefined
+      ? undefined
+      : new TextEncoder().encode(bodyText);
+    const url = `http://localhost:8008${path}`;
+    const unsigned = new Request(url, { method, body });
+    const authorization = await nip98Authorization(secretKey, unsigned, body);
+    return new Request(url, {
+      method,
+      headers: { Authorization: authorization },
+      body,
+    });
+  }
+
+  function clientRequest(
+    method: string,
+    path: string,
+    carrier: "bearer" | "x-api-key" = "bearer",
+  ): Request {
+    const body = method === "GET" || method === "HEAD"
+      ? undefined
+      : JSON.stringify({ model: "routstr/test" });
+    const headers = carrier === "bearer"
+      ? { Authorization: `Bearer ${TEST_API_KEY}` }
+      : { "x-api-key": TEST_API_KEY };
+    return new Request(`http://localhost:8008${path}`, {
+      method,
+      headers,
+      body,
+    });
+  }
+
+  it("allows the complete client inference contract", async () => {
+    const paths = [
+      ...inferenceFamilies.map((family) => `/v1/${family}`),
+      "/chat/completions",
+      "/v1/chat/completions/",
+    ];
+
+    for (const path of paths) {
+      expect((await proxy.handle(clientRequest("POST", path))).status).toBe(200);
+    }
+    expect(upstream.calls).toHaveLength(paths.length);
+    expect(upstream.calls.every(
+      (call) => call.headers.get("authorization") === `Bearer ${TEST_API_KEY}`,
+    )).toBe(true);
+
+    const anthropic = await proxy.handle(
+      clientRequest("POST", "/v1/messages/count_tokens", "x-api-key"),
+    );
+    expect(anthropic.status).toBe(200);
+    expect(upstream.calls.at(-1)!.headers.get("x-api-key")).toBe(TEST_API_KEY);
+    expect(upstream.calls.at(-1)!.headers.get("authorization")).toBeNull();
+  });
+
+  it("blocks client keys from non-inference routes", async () => {
+    const routes = [
+      ["GET", "/keys/api", "bearer"],
+      ["GET", "/keys/api?include=all", "x-api-key"],
+      ["DELETE", "/keys/api/delete?baseUrl=https%3A%2F%2Fprovider.invalid", "bearer"],
+      ["POST", "/future/admin", "bearer"],
+      ["GET", "/v1/chat/completions", "bearer"],
+      ["POST", "/v1/chat/completions/admin", "bearer"],
+      ["POST", "/v1//chat/completions", "bearer"],
+      ["POST", "/v1/chat/completions//", "bearer"],
+    ] as const;
+
+    for (const [method, path, carrier] of routes) {
+      const res = await proxy.handle(clientRequest(method, path, carrier));
+      expect(res.status).toBe(403);
+    }
+    expect(upstream.calls).toHaveLength(0);
+  });
+
+  it("requires admin NIP-98 for provider keys and wallet sends", async () => {
+    const userSecret = registerNpub("user");
+    const adminSecret = registerNpub("admin");
+    const routes = [
+      ["GET", "/keys/api?include=all", undefined],
+      ["POST", "/keys/api/delete", JSON.stringify({ baseUrl: "https://provider.invalid" })],
+      ["DELETE", "/keys/api/delete?baseUrl=https%3A%2F%2Fprovider.invalid", undefined],
+      ["POST", "/wallet/send/cashu", "{}"],
+      ["POST", "/wallet/send/bolt11", "{}"],
+    ] as const;
+
+    for (const [method, path, body] of routes) {
+      const denied = await proxy.handle(
+        await signedRequest(userSecret, method, path, body),
+      );
+      expect(denied.status).toBe(403);
+
+      const allowed = await proxy.handle(
+        await signedRequest(adminSecret, method, path, body),
+      );
+      expect(allowed.status).toBe(200);
+    }
+    expect(upstream.calls).toHaveLength(routes.length);
+    expect(upstream.calls.every(
+      (call) => call.headers.get("authorization") === null,
+    )).toBe(true);
+  });
+
+  it("preserves existing registered-user daemon access", async () => {
+    const secretKey = registerNpub("user");
+    const routes = [
+      ["POST", "/v1/messages/count_tokens", JSON.stringify({ model: "routstr/test" })],
+      ["POST", "/stop", "{}"],
+      ["GET", "/providers?refresh=true", undefined],
+      ["POST", "/nwc/fund", "{}"],
+    ] as const;
+
+    for (const [method, path, body] of routes) {
+      const res = await proxy.handle(
+        await signedRequest(secretKey, method, path, body),
+      );
+      expect(res.status).toBe(200);
+    }
+    expect(upstream.calls).toHaveLength(routes.length);
+    expect(upstream.calls.every(
+      (call) => call.headers.get("authorization") === null,
+    )).toBe(true);
+  });
+
+  it("rejects the leading-double-slash authorization bypass", async () => {
+    const secretKey = registerNpub("user");
+    const res = await proxy.handle(
+      await signedRequest(secretKey, "GET", "//keys/api"),
+    );
+
+    expect(res.status).toBe(400);
+    expect(upstream.calls).toHaveLength(0);
+  });
+});

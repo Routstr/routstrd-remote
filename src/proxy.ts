@@ -585,6 +585,12 @@ export class AuthProxy {
     const path = url.pathname;
     const authorization = requestAuthorization(req);
 
+    // Bun preserves leading `//` inbound but collapses it on outbound fetch,
+    // which would make exact path authorization and the daemon disagree.
+    if (path.startsWith("//")) {
+      return this.json({ error: "Invalid request path." }, 400);
+    }
+
     if (path === "/npubs" || path.startsWith("/npubs/")) {
       return this.handleNpubs(req, path);
     }
@@ -618,10 +624,9 @@ export class AuthProxy {
 
     const bearerMatch = authorization.match(/^Bearer\s+(.+)$/i);
     if (bearerMatch) {
-      // API key: block /clients/add and wallet endpoints
-      if (AuthProxy.isRestrictedPath(path)) {
+      if (!AuthProxy.isInferencePath(req.method, path)) {
         return this.json({
-          error: "API keys cannot access this endpoint. Use NIP-98 auth from a registered npub/pubkey.",
+          error: "API keys can access inference endpoints only. Use NIP-98 auth with the required role.",
         }, 403);
       }
 
@@ -635,10 +640,7 @@ export class AuthProxy {
       // so we can inspect the `model` field. When disabled, keep the
       // original streaming body to avoid the buffering latency.
       let body: Uint8Array | undefined;
-      if (
-        this.config.modelAllowlistEnabled &&
-        (req.method === "POST" || req.method === "PUT" || req.method === "PATCH")
-      ) {
+      if (this.config.modelAllowlistEnabled) {
         body = new Uint8Array(await req.arrayBuffer());
       }
 
@@ -658,29 +660,13 @@ export class AuthProxy {
           ? undefined
           : new Uint8Array(await req.arrayBuffer());
 
-      // Determine required role first to generate the right error message
-      if (AuthProxy.isAdminPath(path)) {
-        const auth = await this.authenticateNpub(req, authorization, body, "admin");
-        if (auth instanceof Response) return auth;
-
-        const blocked = this.checkModelAllowlist(body, req.method);
-        if (blocked) return blocked;
-
-        return this.forward(req, body);
-      }
-
-      if (AuthProxy.isNpubRestrictedPath(path)) {
-        const auth = await this.authenticateNpub(req, authorization, body, "user");
-        if (auth instanceof Response) return auth;
-
-        const blocked = this.checkModelAllowlist(body, req.method);
-        if (blocked) return blocked;
-
-        return this.forward(req, body);
-      }
-
-      // Default: any registered npub can access
-      const auth = await this.authenticateNpub(req, authorization, body, "user");
+      const requiredRole = AuthProxy.isAdminPath(path) ? "admin" : "user";
+      const auth = await this.authenticateNpub(
+        req,
+        authorization,
+        body,
+        requiredRole,
+      );
       if (auth instanceof Response) return auth;
 
       const blocked = this.checkModelAllowlist(body, req.method);
@@ -771,25 +757,19 @@ export class AuthProxy {
   static ADMIN_PATHS = new Set([
     "/wallet/send/cashu",
     "/wallet/send/bolt11",
+    "/keys/api",
+    "/keys/api/delete",
   ]);
 
-  /** Endpoints restricted to registered npubs (admin + user). API keys cannot access. */
-  static NPUB_RESTRICTED_PATHS = new Set([
-    "/wallet/status",
-    "/wallet/unlock",
-    "/wallet/balance",
-    "/wallet/receive/cashu",
-    "/wallet/receive/bolt11",
-    "/wallet/mints",
-    "/wallet/mints/info",
-    // Daemon control: an API key buys inference, nothing more. /providers is
-    // here because ?refresh=true rewrites the stored provider list.
-    "/stop",
-    "/refund",
-    "/refund/xcashu",
-    "/providers",
-    "/providers/enable",
-    "/providers/disable",
+  /** Keep aligned with Routstr Core's credential-safe POST endpoints. */
+  static INFERENCE_PATHS = new Set([
+    "chat/completions",
+    "completions",
+    "responses",
+    "messages",
+    "messages/count_tokens",
+    "embeddings",
+    "systemone",
   ]);
 
   static isPublicPath(path: string): boolean {
@@ -801,11 +781,11 @@ export class AuthProxy {
     return AuthProxy.ADMIN_PATHS.has(path);
   }
 
-  static isNpubRestrictedPath(path: string): boolean {
-    return AuthProxy.NPUB_RESTRICTED_PATHS.has(path) || path.startsWith("/nwc/");
-  }
-
-  static isRestrictedPath(path: string): boolean {
-    return this.isAdminPath(path) || this.isNpubRestrictedPath(path);
+  static isInferencePath(method: string, path: string): boolean {
+    if (method !== "POST") return false;
+    let route = path.slice(1);
+    if (route.endsWith("/")) route = route.slice(0, -1);
+    if (route.startsWith("v1/")) route = route.slice(3);
+    return AuthProxy.INFERENCE_PATHS.has(route);
   }
 }
