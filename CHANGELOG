@@ -1,6 +1,21 @@
 [Unreleased]
 * Fixed the Cloudron `localstorage.sqlite` addon path to point at the real database (`/app/data/routstrd/routstr.db`), so backups take a WAL-aware consistent snapshot instead of a raw filesystem copy
 
+[0.1.29]
+* Money safety: paid mint quotes that were paid but never issued are now recovered instead of being lost
+* Mint recovery is gated per mint, and mints are probed for reachability before they are used
+* API keys and top-up tokens are stored before they are paid for, so a failed payment no longer loses the token
+* Default mint is now Minibits, with cubabitcoin kept as a trusted mint
+* A token is no longer lost when a source mint rejects it as untrusted; the client fails over to another mint
+* Top-up estimates now account for the full request shape (tools, Responses input, image detail)
+* Bounded NWC requests, so `nwc status` can no longer hang forever
+* Canonical model IDs are now used for cooldowns and failover, so aliases like `claude-opus-5-5` resolve to nodes that list only `claude-opus-5.5`
+* Added Nostr-sourced model ID mapping snapshots (kind 38426)
+* Routed requests now forward `x-routstr-model-path`, adding DeepSeek model-path routing
+* Upstream error responses are passed through to the client instead of being flattened
+* Accept Anthropic `x-api-key` credentials
+* Updated bundled routstrd to 0.4.12 and routstr-sdk to 0.4.8
+
 [0.1.28]
 * Fixed a bug that truncated the list of provider announcements
 * Added npub names to the TUI

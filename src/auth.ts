@@ -14,6 +14,16 @@ const PUBLIC_PATHS = new Set([
 
 const PUBLIC_PREFIXES = ["/models/", "/v1/models/"];
 
+/** Authorization takes precedence, including malformed or invalid credentials.
+ * Only requests without that header may use Anthropic's x-api-key carrier.
+ */
+export function requestAuthorization(req: Request): string | null {
+  const authorization = req.headers.get("authorization");
+  if (authorization !== null) return authorization;
+  const apiKey = req.headers.get("x-api-key")?.trim();
+  return apiKey ? `Bearer ${apiKey}` : null;
+}
+
 export interface AuthResult {
   authenticated: boolean;
   client?: Client;
@@ -79,7 +89,7 @@ export async function authenticateRequest(
     return { authenticated: true, isPublicPath: true };
   }
 
-  const authorization = req.headers.get("authorization");
+  const authorization = requestAuthorization(req);
   if (!authorization) {
     return { authenticated: false, isPublicPath: false };
   }

@@ -1,5 +1,6 @@
 import { normalizeNostrPubkey, type AuthProxyConfig } from "./config";
 import { validateNIP98Request } from "./nip98";
+import { requestAuthorization } from "./auth";
 import { type Client, type NpubRole, AuthStore } from "./store";
 
 /**
@@ -582,7 +583,7 @@ export class AuthProxy {
   private async route(req: Request): Promise<Response> {
     const url = new URL(req.url);
     const path = url.pathname;
-    const authorization = req.headers.get("authorization");
+    const authorization = requestAuthorization(req);
 
     if (path === "/npubs" || path.startsWith("/npubs/")) {
       return this.handleNpubs(req, path);
@@ -610,8 +611,8 @@ export class AuthProxy {
     if (!authorization) {
       return this.json({
         error:
-          "Missing Authorization header. " +
-          "Use 'Authorization: Bearer sk-...' or 'Authorization: Nostr <base64-event>'.",
+          "Missing authentication credentials. " +
+          "Use 'Authorization: Bearer sk-...', 'x-api-key: sk-...', or 'Authorization: Nostr <base64-event>'.",
       }, 401);
     }
 
@@ -749,7 +750,7 @@ export class AuthProxy {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
     "Access-Control-Allow-Headers":
-      "Authorization, Content-Type, X-Cashu, X-Routstr-Model",
+      "Authorization, X-Api-Key, Anthropic-Version, Anthropic-Beta, Content-Type, X-Cashu, X-Routstr-Model",
     "Access-Control-Expose-Headers":
       "X-Cashu, X-Routstr-Request-Id, X-Routstr-Cost-Msats, X-Routstr-Cost-Usd, X-Routstr-Input-Cost-Msats, X-Routstr-Output-Cost-Msats",
     "Access-Control-Max-Age": "86400",

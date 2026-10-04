@@ -1334,6 +1334,52 @@
             "creationDate": "Fri, 11 Sep 2026 05:45:56 GMT",
             "ts": "Fri, 11 Sep 2026 05:45:56 GMT",
             "publishState": "published"
+        },
+        "0.1.29": {
+            "manifest": {
+                "id": "io.routstr.routstrd-auth",
+                "title": "Routstrd Auth",
+                "author": "Routstr <hello@routstr.io>",
+                "description": "Auth proxy and daemon for the Routstr AI routing network",
+                "tagline": "Self-hosted Routstr node with bearer-token auth",
+                "version": "0.1.29",
+                "upstreamVersion": "0.1.29",
+                "healthCheckPath": "/health",
+                "httpPort": 8008,
+                "memoryLimit": 536870912,
+                "addons": {
+                    "localstorage": {
+                        "sqlite": {
+                            "paths": [
+                                "/app/data/routstr.db"
+                            ]
+                        }
+                    }
+                },
+                "manifestVersion": 2,
+                "website": "https://routstr.com",
+                "contactEmail": "team@routstr.com",
+                "iconUrl": "https://routstr.com/favicon.ico",
+                "packagerName": "Routstr",
+                "packagerUrl": "https://github.com/Routstr",
+                "minBoxVersion": "9.1.0",
+                "changelog": "* Money safety: paid mint quotes that were paid but never issued are now recovered instead of being lost\n* Mint recovery is gated per mint, and mints are probed for reachability before they are used\n* API keys and top-up tokens are stored before they are paid for, so a failed payment no longer loses the token\n* Default mint is now Minibits, with cubabitcoin kept as a trusted mint\n* A token is no longer lost when a source mint rejects it as untrusted; the client fails over to another mint\n* Top-up estimates now account for the full request shape (tools, Responses input, image detail)\n* Bounded NWC requests, so `nwc status` can no longer hang forever\n* Canonical model IDs are now used for cooldowns and failover, so aliases like `claude-opus-5-5` resolve to nodes that list only `claude-opus-5.5`\n* Added Nostr-sourced model ID mapping snapshots (kind 38426)\n* Routed requests now forward `x-routstr-model-path`, adding DeepSeek model-path routing\n* Upstream error responses are passed through to the client instead of being flattened\n* Accept Anthropic `x-api-key` credentials\n* Updated bundled routstrd to 0.4.12 and routstr-sdk to 0.4.8\n",
+                "postInstallMessage": "Routstrd Auth is now installed.\n\nThe app exposes an OpenAI-compatible Routstr endpoint protected by bearer-token auth. Persistent wallet/config/database data is stored under Cloudron's app data directory and included in backups.\n\nIf you need admin-only client management endpoints, set `routstrd remote <url>` and `routstrd npubs register` to register the first admin npub.\n",
+                "tags": [
+                    "ai",
+                    "proxy",
+                    "nostr",
+                    "bitcoin",
+                    "openai"
+                ],
+                "mediaLinks": [
+                    "https://www.routstr.com/"
+                ],
+                "dockerImage": "ghcr.io/sh1ftred/routstrd-pro:20261002-131649-2c9f458d2"
+            },
+            "creationDate": "Fri, 02 Oct 2026 13:18:43 GMT",
+            "ts": "Fri, 02 Oct 2026 13:18:43 GMT",
+            "publishState": "published"
         }
     }
 }
