@@ -25,9 +25,11 @@ if [[ ! -f "${ROUTSTRD_DIR}/wallet/config.json" ]]; then
     gosu cloudron:cloudron env HOME="${HOME}" ROUTSTRD_DIR="${ROUTSTRD_DIR}" \
         routstrd onboard --skip-integration </dev/null
     # onboard starts a daemon; stop it so supervisord remains the sole owner of
-    # the routstrd process (and its PID file).
+    # the routstrd process (and its PID file). Let a failed stop abort startup:
+    # otherwise supervisord could start while the old daemon still holds the
+    # wallet PID lock.
     gosu cloudron:cloudron env HOME="${HOME}" ROUTSTRD_DIR="${ROUTSTRD_DIR}" \
-        routstrd stop </dev/null 2>/dev/null || true
+        routstrd stop </dev/null
 fi
 
 if [[ ! -f /app/data/.initialized ]]; then
