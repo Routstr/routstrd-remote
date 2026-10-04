@@ -29,6 +29,24 @@ All values have sensible defaults and can be overridden via environment variable
 | `ROUTSTRD_AUTH_MODEL_ALLOWLIST` | `false` | Enable model allowlist enforcement (`true`/`false`) |
 | `ROUTSTRD_DIR` | `~/.routstrd` | Base config directory |
 
+## First admin registration
+
+Starting the auth proxy does **not** automatically register the identity in `config.json` as an admin. Register explicitly when you are ready:
+
+```bash
+# From inside the container (or its Cloudron terminal)
+routstrd npubs register
+
+# Alternatively, from the Docker host
+docker exec -it <container> routstrd npubs register
+```
+
+No npub argument is needed: the CLI derives your npub from the `nsec` in its selected `config.json`. Inside the container this uses the container identity; on another machine it uses that machine's configured identity and auth URL.
+
+When no npubs are registered, `GET /npubs` accepts a valid NIP-98 request so the CLI can check the empty list before registering. The first `POST /npubs` is unauthenticated and defaults to admin; later additions require an existing admin. This bootstrap is **not container-only**: anyone who can reach the endpoint can claim the first-admin slot while the store is empty. Restrict access until registration is complete.
+
+If an admin is already configured (including via `ROUTSTRD_AUTH_ADMIN_*`), use that admin to add other identities with `routstrd npubs add <npub>`.
+
 ## Cloudron
 
 [Cloudron](https://www.cloudron.io/) runs the routstrd server. Team members connect to it as clients using the `routstrd` CLI.
