@@ -443,9 +443,37 @@ export class AuthProxy {
   /** Handle /npubs management endpoints. */
   private async handleNpubs(req: Request, path: string): Promise<Response> {
     if (req.method === "GET" && path === "/npubs") {
+      const authorization = req.headers.get("authorization");
+
+      // Bootstrap read: `routstrd npubs register` first lists npubs to check
+      // whether an admin already exists. Requiring a *registered* npub here
+      // deadlocks bootstrap (nothing is registered yet), so when the store is
+      // empty accept any valid NIP-98 event and return an empty list.
+      if (this.store.countNpubs() === 0) {
+        if (!authorization) {
+          return this.json({
+            error:
+              "Missing Authorization header. This endpoint requires NIP-98 auth from a registered npub/pubkey.",
+          }, 401);
+        }
+        if (!authorization.match(/^Nostr\s+(.+)$/i)) {
+          return this.json({
+            error: "Invalid Authorization format. Expected 'Nostr <base64-event>'.",
+          }, 401);
+        }
+        try {
+          await validateNIP98Request(authorization, req, undefined);
+        } catch (err) {
+          return this.json({
+            error: err instanceof Error ? err.message : "Invalid NIP-98 token.",
+          }, 401);
+        }
+        return this.json({ npubs: [] });
+      }
+
       const auth = await this.authenticateNpub(
         req,
-        req.headers.get("authorization"),
+        authorization,
         undefined,
         "user",
       );
