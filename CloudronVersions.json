@@ -1426,6 +1426,52 @@
             "creationDate": "Sun, 04 Oct 2026 14:57:08 GMT",
             "ts": "Sun, 04 Oct 2026 14:57:08 GMT",
             "publishState": "published"
+        },
+        "0.1.31": {
+            "manifest": {
+                "id": "io.routstr.routstrd-auth",
+                "title": "Routstrd Auth",
+                "author": "Routstr <hello@routstr.io>",
+                "description": "Auth proxy and daemon for the Routstr AI routing network",
+                "tagline": "Self-hosted Routstr node with bearer-token auth",
+                "version": "0.1.31",
+                "upstreamVersion": "0.1.31",
+                "healthCheckPath": "/health",
+                "httpPort": 8008,
+                "memoryLimit": 536870912,
+                "addons": {
+                    "localstorage": {
+                        "sqlite": {
+                            "paths": [
+                                "/app/data/routstrd/routstr.db"
+                            ]
+                        }
+                    }
+                },
+                "manifestVersion": 2,
+                "website": "https://routstr.com",
+                "contactEmail": "team@routstr.com",
+                "iconUrl": "https://routstr.com/favicon.ico",
+                "packagerName": "Routstr",
+                "packagerUrl": "https://github.com/Routstr",
+                "minBoxVersion": "9.1.0",
+                "changelog": "* Fixed fresh installs crash-looping on first boot: the Cashu wallet is now initialized when it is missing, and the data directory is re-owned by the `cloudron` user, so the daemon can create its wallet and log files instead of dying with ENOENT/EACCES\n* Startup now fails closed if the onboarding daemon cannot be stopped, so supervisord can no longer start while a stale daemon still holds the wallet PID lock\n* Added regression tests covering first-boot failures\n* `routstrd` is now pinned to 0.4.14 so builds are reproducible: unpinned, the install resolved npm `latest` at build time and a cached layer could silently ship a stale daemon. The bundled versions are unchanged (routstrd 0.4.14, routstr-sdk 0.4.9)\n",
+                "postInstallMessage": "Routstrd Auth is now installed.\n\nThe app exposes an OpenAI-compatible Routstr endpoint protected by bearer-token auth. Persistent wallet/config/database data is stored under Cloudron's app data directory and included in backups.\n\nIf you need admin-only client management endpoints, set `routstrd remote <url>` and `routstrd npubs register` to register the first admin npub.\n",
+                "tags": [
+                    "ai",
+                    "proxy",
+                    "nostr",
+                    "bitcoin",
+                    "openai"
+                ],
+                "mediaLinks": [
+                    "https://www.routstr.com/"
+                ],
+                "dockerImage": "ghcr.io/sh1ftred/routstrd-pro:20261004-160002-f20fd3b58"
+            },
+            "creationDate": "Sun, 04 Oct 2026 16:14:01 GMT",
+            "ts": "Sun, 04 Oct 2026 16:14:01 GMT",
+            "publishState": "published"
         }
     }
 }
