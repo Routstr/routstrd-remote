@@ -1,3 +1,9 @@
+[0.1.31]
+* Fixed fresh installs crash-looping on first boot: the Cashu wallet is now initialized when it is missing, and the data directory is re-owned by the `cloudron` user, so the daemon can create its wallet and log files instead of dying with ENOENT/EACCES
+* Startup now fails closed if the onboarding daemon cannot be stopped, so supervisord can no longer start while a stale daemon still holds the wallet PID lock
+* Added regression tests covering first-boot failures
+* `routstrd` is now pinned to 0.4.14 so builds are reproducible: unpinned, the install resolved npm `latest` at build time and a cached layer could silently ship a stale daemon. The bundled versions are unchanged (routstrd 0.4.14, routstr-sdk 0.4.9)
+
 [0.1.30]
 * Cloudron backups now snapshot the real SQLite database (`/app/data/routstrd/routstr.db`) through the WAL-aware sqlite addon instead of a raw filesystem copy of `/app/data`, so a backup taken while the daemon is writing is consistent and restores are not corrupt
 * First-admin bootstrap works on a fresh install: `routstrd npubs register` can now read the empty npub store, so registering the first admin no longer fails with an auth error before it can POST
