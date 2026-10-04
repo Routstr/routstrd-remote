@@ -1,3 +1,16 @@
+[0.1.30]
+* Cloudron backups now snapshot the real SQLite database (`/app/data/routstrd/routstr.db`) through the WAL-aware sqlite addon instead of a raw filesystem copy of `/app/data`, so a backup taken while the daemon is writing is consistent and restores are not corrupt
+* First-admin bootstrap works on a fresh install: `routstrd npubs register` can now read the empty npub store, so registering the first admin no longer fails with an auth error before it can POST
+* Documented the first-admin registration flow and its caveat: while the store is empty the first `POST /npubs` is unauthenticated and claims the admin slot, so anyone who can reach the endpoint can claim it -- restrict access until registration is complete
+* Provider mint awareness: the daemon discovers and caches which mints each provider accepts, and the client refuses mints a provider rejects and fails over on a mint shortfall or a top-up the wallet cannot fund, instead of losing the request
+* A provider pin forced by the caller is now preserved during failover, and provider pinning is strict
+* The API key is kept when an upstream request errors, and API keys a provider proves empty are dropped from the wallet
+* Failover now sends forwarded API paths with the `/v1` prefix, and per-node unknown-path 404s fail over instead of failing the request
+* Provider base URLs are now versioned and Anthropic models are rooted correctly for the `pi` integration
+* The CLI normalizes remote URLs, retries the other loopback family, and no longer replays writes after an ambiguous connection failure (avoiding duplicate operations)
+* History now shows which entries are waiting or cancelled
+* Updated bundled routstrd to 0.4.14 and routstr-sdk to 0.4.9
+
 [0.1.29]
 * Money safety: paid mint quotes that were paid but never issued are now recovered instead of being lost
 * Mint recovery is gated per mint, and mints are probed for reachability before they are used
