@@ -217,6 +217,19 @@ describe("npub name endpoints", () => {
     expect(res.status).toBe(401);
   });
 
+  it("GET /npubs allows NIP-98 bootstrap when no npubs are configured", async () => {
+    const secretKey = generateSecretKey();
+    const req = new Request("http://localhost:8008/npubs");
+    const auth = await nip98Authorization(secretKey, req);
+    const res = await proxy.handle(
+      new Request(req.url, { headers: { Authorization: auth } }),
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.npubs).toEqual([]);
+  });
+
   it("GET /npubs returns names for an authenticated npub", async () => {
     const secretKey = generateSecretKey();
     const pubkey = getPublicKey(secretKey);
