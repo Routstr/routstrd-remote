@@ -31,7 +31,11 @@ RUN apt-get update \
 # Install routstrd daemon globally. The global install lives
 # under /usr/local/bun, not /root, so supervised processes running as cloudron
 # can execute the binaries on Cloudron's read-only root filesystem.
-RUN bun install --global routstrd \
+#
+# Pin the version: unpinned, this layer resolves npm `latest` at build time, so
+# builds are not reproducible and a cached layer can silently ship a stale
+# daemon (observed shipping 0.4.12 while 0.4.14 was `latest`).
+RUN bun install --global routstrd@0.4.14 \
     && ln -sf /usr/local/bun/bin/routstrd /usr/local/bin/routstrd \
     && test -f /usr/local/bun/install/global/node_modules/routstrd/dist/daemon/index.js
 
