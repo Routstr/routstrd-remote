@@ -1472,6 +1472,52 @@
             "creationDate": "Sun, 04 Oct 2026 16:14:01 GMT",
             "ts": "Sun, 04 Oct 2026 16:14:01 GMT",
             "publishState": "published"
+        },
+        "0.1.32": {
+            "manifest": {
+                "id": "io.routstr.routstrd-auth",
+                "title": "Routstrd Auth",
+                "author": "Routstr <hello@routstr.io>",
+                "description": "Auth proxy and daemon for the Routstr AI routing network",
+                "tagline": "Self-hosted Routstr node with bearer-token auth",
+                "version": "0.1.32",
+                "upstreamVersion": "0.1.32",
+                "healthCheckPath": "/health",
+                "httpPort": 8008,
+                "memoryLimit": 536870912,
+                "addons": {
+                    "localstorage": {
+                        "sqlite": {
+                            "paths": [
+                                "/app/data/routstrd/routstr.db"
+                            ]
+                        }
+                    }
+                },
+                "manifestVersion": 2,
+                "website": "https://routstr.com",
+                "contactEmail": "team@routstr.com",
+                "iconUrl": "https://routstr.com/favicon.ico",
+                "packagerName": "Routstr",
+                "packagerUrl": "https://github.com/Routstr",
+                "minBoxVersion": "9.1.0",
+                "changelog": "* Auto-refill now checks the NWC balance before creating an invoice, and a refill invoice that times out is waited on until it reaches a final state before paying again, so a slow Lightning payment can no longer be paid twice\n* Refund tokens the mint reports already spent are dropped, so they no longer linger in storage and inflate the held balance\n* Mint recovery probes now hold their deadline even when fetch ignores the abort signal, so a down mint can no longer hold the recovery gate open\n* Model and upstream-path cooldowns are now exponential: a qualifying failure cools its own scope for 10s, doubling per consecutive failure up to 10 minutes. Streaks survive cooldown expiry and restarts, `routstrd cooldowns --reset` clears them, and the CLI reports expiries, path scope and failure streaks\n* Model-path resolution is spelling-aware: node `alias_ids` are retained and paths are merged across every spelling of a model, so a node advertising only a variant spelling is no longer dropped from routing. Added PPQ, Venice and Wafer DeepSeek routes\n* Auto-pin failover now degrades to ordinary provider routing instead of exhausting the request; per-model path lookups are fetched once per spelling and cached, and each node gets a 6s ranking budget so one slow node's oversized path payload can no longer make every request pay its timeout\n* Provider enable/disable reports the policy that actually took effect, backed by a two-tier Nostr review-label policy (default-enabled labels vs explicit opt-in)\n* Unreachable providers can no longer stall discovery: provider fetches get an independent deadline (~3s instead of up to ~136s), model-path lookups are bounded, the four relay filters refresh concurrently, and unchanged model shards are skipped during incremental discovery\n* Usage windows are now timezone-correct (IANA zone with DST-aware calendar arithmetic) and aggregate in SQL, cutting 7d over a 20k-row database from ~570ms to ~120ms\n* Added time-window filtering across the TUI, including a window-driven History tab with a dual-axis spend/token chart\n* The CLI prompts to update routstrd on start and restart, backed by daemon-side update state shared by the CLI and TUI, and added a `rout` alias for the binary\n* Startup no longer repeats discovery work, and onboarding waits for a non-empty model list and warns instead of aborting when an integration installer fails\n* Updated bundled routstrd to 0.4.17 and routstr-sdk to 0.4.12\n",
+                "postInstallMessage": "Routstrd Auth is now installed.\n\nThe app exposes an OpenAI-compatible Routstr endpoint protected by bearer-token auth. Persistent wallet/config/database data is stored under Cloudron's app data directory and included in backups.\n\nIf you need admin-only client management endpoints, set `routstrd remote <url>` and `routstrd npubs register` to register the first admin npub.\n",
+                "tags": [
+                    "ai",
+                    "proxy",
+                    "nostr",
+                    "bitcoin",
+                    "openai"
+                ],
+                "mediaLinks": [
+                    "https://www.routstr.com/"
+                ],
+                "dockerImage": "ghcr.io/sh1ftred/routstrd-pro:20261014-022516-8e11f36ef"
+            },
+            "creationDate": "Wed, 14 Oct 2026 02:30:59 GMT",
+            "ts": "Wed, 14 Oct 2026 02:30:59 GMT",
+            "publishState": "published"
         }
     }
 }
