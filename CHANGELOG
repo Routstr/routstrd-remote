@@ -1,3 +1,18 @@
+[0.1.32]
+* Auto-refill now checks the NWC balance before creating an invoice, and a refill invoice that times out is waited on until it reaches a final state before paying again, so a slow Lightning payment can no longer be paid twice
+* Refund tokens the mint reports already spent are dropped, so they no longer linger in storage and inflate the held balance
+* Mint recovery probes now hold their deadline even when fetch ignores the abort signal, so a down mint can no longer hold the recovery gate open
+* Model and upstream-path cooldowns are now exponential: a qualifying failure cools its own scope for 10s, doubling per consecutive failure up to 10 minutes. Streaks survive cooldown expiry and restarts, `routstrd cooldowns --reset` clears them, and the CLI reports expiries, path scope and failure streaks
+* Model-path resolution is spelling-aware: node `alias_ids` are retained and paths are merged across every spelling of a model, so a node advertising only a variant spelling is no longer dropped from routing. Added PPQ, Venice and Wafer DeepSeek routes
+* Auto-pin failover now degrades to ordinary provider routing instead of exhausting the request; per-model path lookups are fetched once per spelling and cached, and each node gets a 6s ranking budget so one slow node's oversized path payload can no longer make every request pay its timeout
+* Provider enable/disable reports the policy that actually took effect, backed by a two-tier Nostr review-label policy (default-enabled labels vs explicit opt-in)
+* Unreachable providers can no longer stall discovery: provider fetches get an independent deadline (~3s instead of up to ~136s), model-path lookups are bounded, the four relay filters refresh concurrently, and unchanged model shards are skipped during incremental discovery
+* Usage windows are now timezone-correct (IANA zone with DST-aware calendar arithmetic) and aggregate in SQL, cutting 7d over a 20k-row database from ~570ms to ~120ms
+* Added time-window filtering across the TUI, including a window-driven History tab with a dual-axis spend/token chart
+* The CLI prompts to update routstrd on start and restart, backed by daemon-side update state shared by the CLI and TUI, and added a `rout` alias for the binary
+* Startup no longer repeats discovery work, and onboarding waits for a non-empty model list and warns instead of aborting when an integration installer fails
+* Updated bundled routstrd to 0.4.17 and routstr-sdk to 0.4.12
+
 [0.1.31]
 * Fixed fresh installs crash-looping on first boot: the Cashu wallet is now initialized when it is missing, and the data directory is re-owned by the `cloudron` user, so the daemon can create its wallet and log files instead of dying with ENOENT/EACCES
 * Startup now fails closed if the onboarding daemon cannot be stopped, so supervisord can no longer start while a stale daemon still holds the wallet PID lock
