@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM cloudron/base:5.0.0@sha256:04fd70dbd8ad6149c19de39e35718e024417c3e01dc9c6637eaf4a41ec4e596c
+FROM docker.io/cloudron/base:5.0.0@sha256:04fd70dbd8ad6149c19de39e35718e024417c3e01dc9c6637eaf4a41ec4e596c
 
 USER root
 
@@ -9,7 +9,7 @@ USER root
 # Use Bun's x64-baseline build instead of the installer auto-detected build.
 # Some Cloudron hosts/VMs do not expose AVX/AVX2 CPU instructions; the regular
 # x64 Bun binary can crash there with SIGILL ("Illegal instruction").
-ARG BUN_VERSION=1.2.22
+ARG BUN_VERSION=1.4.4
 ARG BUN_TARGET=bun-linux-x64-baseline
 ENV BUN_INSTALL=/usr/local/bun
 ENV ROUTSTRD_DIR=/app/data/routstrd
