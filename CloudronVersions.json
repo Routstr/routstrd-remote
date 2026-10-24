@@ -1518,6 +1518,52 @@
             "creationDate": "Wed, 14 Oct 2026 02:30:59 GMT",
             "ts": "Wed, 14 Oct 2026 02:30:59 GMT",
             "publishState": "published"
+        },
+        "0.1.33": {
+            "manifest": {
+                "id": "io.routstr.routstrd-auth",
+                "title": "Routstrd Auth",
+                "author": "Routstr <hello@routstr.io>",
+                "description": "Auth proxy and daemon for the Routstr AI routing network",
+                "tagline": "Self-hosted Routstr node with bearer-token auth",
+                "version": "0.1.33",
+                "upstreamVersion": "0.1.33",
+                "healthCheckPath": "/health",
+                "httpPort": 8008,
+                "memoryLimit": 536870912,
+                "addons": {
+                    "localstorage": {
+                        "sqlite": {
+                            "paths": [
+                                "/app/data/routstrd/routstr.db"
+                            ]
+                        }
+                    }
+                },
+                "manifestVersion": 2,
+                "website": "https://routstr.com",
+                "contactEmail": "team@routstr.com",
+                "iconUrl": "https://routstr.com/favicon.ico",
+                "packagerName": "Routstr",
+                "packagerUrl": "https://github.com/Routstr",
+                "minBoxVersion": "9.1.0",
+                "changelog": "* Security: the image now runs Bun 1.4.4, whose bundled CA roots no longer include the compromised \"emSign ECC Root CA - G3\" and \"AAA Certificate Services\" roots. The daemon used to complete TLS handshakes with certificates chaining to those roots; browsers blocked them, but the daemon does not check revocation, so outbound calls to a forged endpoint could be intercepted. Those chains now fail to verify\n* The system CA bundle in the image was refreshed at the same time and no longer carries the compromised roots either, so anything else in the container that uses the OS trust store is covered too\n* Updated bundled routstrd to 0.4.18 and routstr-sdk to 0.4.13\n",
+                "postInstallMessage": "Routstrd Auth is now installed.\n\nThe app exposes an OpenAI-compatible Routstr endpoint protected by bearer-token auth. Persistent wallet/config/database data is stored under Cloudron's app data directory and included in backups.\n\nIf you need admin-only client management endpoints, set `routstrd remote <url>` and `routstrd npubs register` to register the first admin npub.\n",
+                "tags": [
+                    "ai",
+                    "proxy",
+                    "nostr",
+                    "bitcoin",
+                    "openai"
+                ],
+                "mediaLinks": [
+                    "https://www.routstr.com/"
+                ],
+                "dockerImage": "ghcr.io/sh1ftred/routstrd-pro:20261023-164755-b5e186d77"
+            },
+            "creationDate": "Sat, 24 Oct 2026 04:20:19 GMT",
+            "ts": "Sat, 24 Oct 2026 04:20:19 GMT",
+            "publishState": "published"
         }
     }
 }
