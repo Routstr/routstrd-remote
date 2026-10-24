@@ -1,3 +1,8 @@
+[0.1.33]
+* Security: the image now runs Bun 1.4.4, whose bundled CA roots no longer include the compromised "emSign ECC Root CA - G3" and "AAA Certificate Services" roots. The daemon used to complete TLS handshakes with certificates chaining to those roots; browsers blocked them, but the daemon does not check revocation, so outbound calls to a forged endpoint could be intercepted. Those chains now fail to verify
+* The system CA bundle in the image was refreshed at the same time and no longer carries the compromised roots either, so anything else in the container that uses the OS trust store is covered too
+* Updated bundled routstrd to 0.4.18 and routstr-sdk to 0.4.13
+
 [0.1.32]
 * Auto-refill now checks the NWC balance before creating an invoice, and a refill invoice that times out is waited on until it reaches a final state before paying again, so a slow Lightning payment can no longer be paid twice
 * Refund tokens the mint reports already spent are dropped, so they no longer linger in storage and inflate the held balance
