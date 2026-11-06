@@ -1,12 +1,14 @@
 {
   "name": "routstrd-auth",
-  "version": "0.1.33",
+  "version": "0.1.35",
   "type": "module",
   "scripts": {
     "start": "bun run src/index.ts",
     "dev": "bun --watch run src/index.ts",
     "build": "bun build src/index.ts --outdir dist --target bun",
-    "test": "bun test"
+    "test": "bun test",
+    "scan": "bash scripts/security-scan.sh",
+    "publish-image": "bash scripts/publish-image.sh"
   },
   "dependencies": {
     "commander": "^14.0.2",
