@@ -1,0 +1,129 @@
+# .trivyignore.yaml — accepted-risk allowlist for the release security gate.
+#
+# scripts/security-scan.sh reads this file (via `trivy --ignorefile`) and fails
+# the release on any CRITICAL vulnerability that is NOT listed here. Anything
+# listed here is dropped from the report, so this file is the only way a
+# known-bad finding can ship — treat it like a signed exception list:
+#
+#   * every entry needs a `statement` (why it is not exploitable here, who owns
+#     the fix) and an `expiredAt` date, max 90 days out;
+#   * expired entries stop being honoured, so the gate starts failing again on
+#     its own — that is the point;
+#   * review it on every release with `git log -p .trivyignore.yaml`.
+#
+# Everything below is inherited from cloudron/base:6.0.1; the gate reports
+# "introduced by this image: 0". Never add an entry for a finding this repo
+# introduced — fix it instead.
+#
+# doc: https://trivy.dev/latest/docs/configuration/filtering/#trivyignoreyaml
+vulnerabilities:
+  # linux-libc-dev (kernel UAPI headers) — fix available upstream, clears with the next base rebuild
+  - id: CVE-2026-89530
+    statement: >-
+      Inherited from cloudron/base:6.0.1. linux-libc-dev ships kernel UAPI headers only: no
+      kernel code from it is executed by this app, and the running kernel is the Cloudron
+      host's, which Cloudron patches. Ubuntu has published a fixed header package
+      (7.0.0-42.42), so this clears on the next cloudron/base rebuild. Owner: Cloudron base
+      image.
+    expiredAt: "2027-01-31"
+  - id: CVE-2026-89652
+    statement: >-
+      Inherited from cloudron/base:6.0.1. linux-libc-dev ships kernel UAPI headers only: no
+      kernel code from it is executed by this app, and the running kernel is the Cloudron
+      host's, which Cloudron patches. Ubuntu has published a fixed header package
+      (7.0.0-42.42), so this clears on the next cloudron/base rebuild. Owner: Cloudron base
+      image.
+    expiredAt: "2027-01-31"
+  - id: CVE-2026-89659
+    statement: >-
+      Inherited from cloudron/base:6.0.1. linux-libc-dev ships kernel UAPI headers only: no
+      kernel code from it is executed by this app, and the running kernel is the Cloudron
+      host's, which Cloudron patches. Ubuntu has published a fixed header package
+      (7.0.0-42.42), so this clears on the next cloudron/base rebuild. Owner: Cloudron base
+      image.
+    expiredAt: "2027-01-31"
+  - id: CVE-2026-89708
+    statement: >-
+      Inherited from cloudron/base:6.0.1. linux-libc-dev ships kernel UAPI headers only: no
+      kernel code from it is executed by this app, and the running kernel is the Cloudron
+      host's, which Cloudron patches. Ubuntu has published a fixed header package
+      (7.0.0-42.42), so this clears on the next cloudron/base rebuild. Owner: Cloudron base
+      image.
+    expiredAt: "2027-01-31"
+  - id: CVE-2026-90037
+    statement: >-
+      Inherited from cloudron/base:6.0.1. linux-libc-dev ships kernel UAPI headers only: no
+      kernel code from it is executed by this app, and the running kernel is the Cloudron
+      host's, which Cloudron patches. Ubuntu has published a fixed header package
+      (7.0.0-42.42), so this clears on the next cloudron/base rebuild. Owner: Cloudron base
+      image.
+    expiredAt: "2027-01-31"
+  - id: CVE-2026-93221
+    statement: >-
+      Inherited from cloudron/base:6.0.1. linux-libc-dev ships kernel UAPI headers only: no
+      kernel code from it is executed by this app, and the running kernel is the Cloudron
+      host's, which Cloudron patches. Ubuntu has published a fixed header package
+      (7.0.0-42.42), so this clears on the next cloudron/base rebuild. Owner: Cloudron base
+      image.
+    expiredAt: "2027-01-31"
+  - id: CVE-2026-98365
+    statement: >-
+      Inherited from cloudron/base:6.0.1. linux-libc-dev ships kernel UAPI headers only: no
+      kernel code from it is executed by this app, and the running kernel is the Cloudron
+      host's, which Cloudron patches. Ubuntu has published a fixed header package
+      (7.0.0-42.42), so this clears on the next cloudron/base rebuild. Owner: Cloudron base
+      image.
+    expiredAt: "2027-01-31"
+  - id: CVE-2026-98571
+    statement: >-
+      Inherited from cloudron/base:6.0.1. linux-libc-dev ships kernel UAPI headers only: no
+      kernel code from it is executed by this app, and the running kernel is the Cloudron
+      host's, which Cloudron patches. Ubuntu has published a fixed header package
+      (7.0.0-42.42), so this clears on the next cloudron/base rebuild. Owner: Cloudron base
+      image.
+    expiredAt: "2027-01-31"
+  - id: CVE-2026-98621
+    statement: >-
+      Inherited from cloudron/base:6.0.1. linux-libc-dev ships kernel UAPI headers only: no
+      kernel code from it is executed by this app, and the running kernel is the Cloudron
+      host's, which Cloudron patches. Ubuntu has published a fixed header package
+      (7.0.0-42.42), so this clears on the next cloudron/base rebuild. Owner: Cloudron base
+      image.
+    expiredAt: "2027-01-31"
+  # linux-libc-dev (kernel UAPI headers) — no upstream fix yet
+  - id: CVE-2026-90162
+    statement: >-
+      Inherited from cloudron/base:6.0.1. linux-libc-dev ships kernel UAPI headers only: no
+      kernel code from it is executed by this app, and the running kernel is the Cloudron
+      host's, which Cloudron patches. Ubuntu has not published a fixed package yet, so there
+      is nothing to bump here. Owner: Cloudron base image / Ubuntu kernel team.
+    expiredAt: "2027-01-31"
+  - id: CVE-2026-98432
+    statement: >-
+      Inherited from cloudron/base:6.0.1. linux-libc-dev ships kernel UAPI headers only: no
+      kernel code from it is executed by this app, and the running kernel is the Cloudron
+      host's, which Cloudron patches. Ubuntu has not published a fixed package yet, so there
+      is nothing to bump here. Owner: Cloudron base image / Ubuntu kernel team.
+    expiredAt: "2027-01-31"
+  - id: CVE-2026-98725
+    statement: >-
+      Inherited from cloudron/base:6.0.1. linux-libc-dev ships kernel UAPI headers only: no
+      kernel code from it is executed by this app, and the running kernel is the Cloudron
+      host's, which Cloudron patches. Ubuntu has not published a fixed package yet, so there
+      is nothing to bump here. Owner: Cloudron base image / Ubuntu kernel team.
+    expiredAt: "2027-01-31"
+  - id: CVE-2026-98805
+    statement: >-
+      Inherited from cloudron/base:6.0.1. linux-libc-dev ships kernel UAPI headers only: no
+      kernel code from it is executed by this app, and the running kernel is the Cloudron
+      host's, which Cloudron patches. Ubuntu has not published a fixed package yet, so there
+      is nothing to bump here. Owner: Cloudron base image / Ubuntu kernel team.
+    expiredAt: "2027-01-31"
+  # gosu (Go stdlib) — needs a Cloudron rebuild of the helper
+  - id: CVE-2025-68121
+    statement: >-
+      Inherited from cloudron/base:6.0.1. gosu is Cloudron's privilege-drop helper, executed
+      once at container start to run routstrd as the cloudron user. It parses no untrusted
+      input in this app, and none of its HTTP/JSON/XML parsing paths are reachable. Fix
+      requires Cloudron to rebuild gosu with Go >= 1.24.13. Owner: Cloudron base image.
+    expiredAt: "2027-01-31"
