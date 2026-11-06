@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { nip19 } from "nostr-tools";
+import { monthStart } from "./quota";
 
 export interface Client {
   clientId: string;
@@ -20,6 +21,38 @@ export interface NpubEntry {
   createdBy: string | null;
   source: string;
   role: NpubRole;
+  /**
+   * Monthly spend cap in sats, or null for no limit. Spend resets on the first
+   * of each calendar month (server local time).
+   */
+  monthlyLimitSats: number | null;
+}
+
+interface NpubRow {
+  pubkey: string;
+  npub: string;
+  name: string | null;
+  created_at: number;
+  created_by: string | null;
+  source: string;
+  role: NpubRole;
+  monthly_limit_sats: number | null;
+}
+
+const NPUB_COLUMNS =
+  "pubkey, npub, name, created_at, created_by, source, role, monthly_limit_sats";
+
+function rowToNpubEntry(row: NpubRow): NpubEntry {
+  return {
+    pubkey: row.pubkey,
+    npub: row.npub,
+    name: row.name,
+    createdAt: row.created_at,
+    createdBy: row.created_by,
+    source: row.source,
+    role: row.role,
+    monthlyLimitSats: row.monthly_limit_sats ?? null,
+  };
 }
 
 /**
@@ -53,7 +86,8 @@ export class AuthStore {
           created_at INTEGER NOT NULL,
           created_by TEXT,
           source TEXT NOT NULL DEFAULT 'api',
-          role TEXT NOT NULL DEFAULT 'admin' CHECK (role IN ('admin', 'user'))
+          role TEXT NOT NULL DEFAULT 'admin' CHECK (role IN ('admin', 'user')),
+          monthly_limit_sats INTEGER
         )
       `);
 
@@ -63,6 +97,14 @@ export class AuthStore {
         .all() as Array<{ name: string }>;
       if (!cols.some((c) => c.name === "name")) {
         this.db.run("ALTER TABLE routstr_auth_npubs ADD COLUMN name TEXT");
+      }
+
+      // Migrate: add the monthly spend cap. NULL means unlimited, which is
+      // also the right default for every npub registered before this existed.
+      if (!cols.some((c) => c.name === "monthly_limit_sats")) {
+        this.db.run(
+          "ALTER TABLE routstr_auth_npubs ADD COLUMN monthly_limit_sats INTEGER",
+        );
       }
 
       // Check if the legacy table exists and migrate its data.
@@ -93,9 +135,9 @@ export class AuthStore {
     this.db.transaction(() => {
       const insert = this.db.prepare(`
         INSERT OR IGNORE INTO routstr_auth_npubs
-          (pubkey, npub, created_at, created_by, source, role)
+          (pubkey, npub, created_at, created_by, source, role, monthly_limit_sats)
         VALUES
-          (?, ?, ?, NULL, 'env', 'admin')
+          (?, ?, ?, NULL, 'env', 'admin', NULL)
       `);
       for (const pubkey of uniquePubkeys) {
         insert.run(pubkey, nip19.npubEncode(pubkey), now);
@@ -162,26 +204,10 @@ export class AuthStore {
     const where = role ? " WHERE role = ?" : "";
     const params = role ? [role] : [];
     const rows = this.db
-      .query(`SELECT pubkey, npub, name, created_at, created_by, source, role FROM routstr_auth_npubs${where} ORDER BY created_at ASC, npub ASC`)
-      .all(...params) as Array<{
-        pubkey: string;
-        npub: string;
-        name: string | null;
-        created_at: number;
-        created_by: string | null;
-        source: string;
-        role: NpubRole;
-      }>;
+      .query(`SELECT ${NPUB_COLUMNS} FROM routstr_auth_npubs${where} ORDER BY created_at ASC, npub ASC`)
+      .all(...params) as NpubRow[];
 
-    return rows.map((row) => ({
-      pubkey: row.pubkey,
-      npub: row.npub,
-      name: row.name,
-      createdAt: row.created_at,
-      createdBy: row.created_by,
-      source: row.source,
-      role: row.role,
-    }));
+    return rows.map(rowToNpubEntry);
   }
 
   /** @deprecated Use `countNpubs()` or `countNpubs('admin')`. */
@@ -219,30 +245,19 @@ export class AuthStore {
 
   getNpubByPubkey(pubkey: string): NpubEntry | undefined {
     const row = this.db
-      .query("SELECT pubkey, npub, name, created_at, created_by, source, role FROM routstr_auth_npubs WHERE pubkey = ?")
-      .get(pubkey.toLowerCase()) as {
-        pubkey: string;
-        npub: string;
-        name: string | null;
-        created_at: number;
-        created_by: string | null;
-        source: string;
-        role: NpubRole;
-      } | null;
+      .query(`SELECT ${NPUB_COLUMNS} FROM routstr_auth_npubs WHERE pubkey = ?`)
+      .get(pubkey.toLowerCase()) as NpubRow | null;
 
-    if (!row) return undefined;
-    return {
-      pubkey: row.pubkey,
-      npub: row.npub,
-      name: row.name,
-      createdAt: row.created_at,
-      createdBy: row.created_by,
-      source: row.source,
-      role: row.role,
-    };
+    return row ? rowToNpubEntry(row) : undefined;
   }
 
-  addNpub(pubkey: string, role: NpubRole = "admin", createdBy: string | null = null, name: string | null = null): NpubEntry & { added: boolean } {
+  addNpub(
+    pubkey: string,
+    role: NpubRole = "admin",
+    createdBy: string | null = null,
+    name: string | null = null,
+    monthlyLimitSats: number | null = null,
+  ): NpubEntry & { added: boolean } {
     const normalizedPubkey = pubkey.toLowerCase();
     const npub = nip19.npubEncode(normalizedPubkey);
     const now = Math.floor(Date.now() / 1000);
@@ -250,32 +265,26 @@ export class AuthStore {
     const result = this.db
       .prepare(`
         INSERT OR IGNORE INTO routstr_auth_npubs
-          (pubkey, npub, name, created_at, created_by, source, role)
+          (pubkey, npub, name, created_at, created_by, source, role, monthly_limit_sats)
         VALUES
-          (?, ?, ?, ?, ?, 'api', ?)
+          (?, ?, ?, ?, ?, 'api', ?, ?)
       `)
-      .run(normalizedPubkey, npub, name, now, createdBy?.toLowerCase() ?? null, role);
+      .run(
+        normalizedPubkey,
+        npub,
+        name,
+        now,
+        createdBy?.toLowerCase() ?? null,
+        role,
+        monthlyLimitSats,
+      );
 
     const row = this.db
-      .query("SELECT pubkey, npub, name, created_at, created_by, source, role FROM routstr_auth_npubs WHERE pubkey = ?")
-      .get(normalizedPubkey) as {
-        pubkey: string;
-        npub: string;
-        name: string | null;
-        created_at: number;
-        created_by: string | null;
-        source: string;
-        role: NpubRole;
-      };
+      .query(`SELECT ${NPUB_COLUMNS} FROM routstr_auth_npubs WHERE pubkey = ?`)
+      .get(normalizedPubkey) as NpubRow;
 
     return {
-      pubkey: row.pubkey,
-      npub: row.npub,
-      name: row.name,
-      createdAt: row.created_at,
-      createdBy: row.created_by,
-      source: row.source,
-      role: row.role,
+      ...rowToNpubEntry(row),
       added: result.changes > 0,
     };
   }
@@ -291,7 +300,11 @@ export class AuthStore {
    */
   updateNpub(
     pubkey: string,
-    updates: { role?: NpubRole; name?: string | null },
+    updates: {
+      role?: NpubRole;
+      name?: string | null;
+      monthlyLimitSats?: number | null;
+    },
   ): NpubEntry | null {
     const normalizedPubkey = pubkey.toLowerCase();
     const existing = this.getNpubByPubkey(normalizedPubkey);
@@ -299,6 +312,7 @@ export class AuthStore {
 
     const role = updates.role;
     const name = updates.name;
+    const monthlyLimitSats = updates.monthlyLimitSats;
 
     this.db.transaction(() => {
       if (role !== undefined) {
@@ -312,6 +326,14 @@ export class AuthStore {
           .prepare("UPDATE routstr_auth_npubs SET name = ? WHERE pubkey = ?")
           .run(name, normalizedPubkey);
       }
+
+      if (monthlyLimitSats !== undefined) {
+        this.db
+          .prepare(
+            "UPDATE routstr_auth_npubs SET monthly_limit_sats = ? WHERE pubkey = ?",
+          )
+          .run(monthlyLimitSats, normalizedPubkey);
+      }
     })();
 
     return this.getNpubByPubkey(normalizedPubkey)!;
@@ -323,6 +345,72 @@ export class AuthStore {
 
   updateNpubName(pubkey: string, name: string | null): NpubEntry | null {
     return this.updateNpub(pubkey, { name });
+  }
+
+  updateNpubMonthlyLimit(
+    pubkey: string,
+    monthlyLimitSats: number | null,
+  ): NpubEntry | null {
+    return this.updateNpub(pubkey, { monthlyLimitSats });
+  }
+
+  /**
+   * Sats spent per client id since the start of the current calendar month.
+   *
+   * Reads the daemon's `usage_tracking` table (timestamps are Unix ms).
+   * Throws when accounting is unavailable, including a missing usage table;
+   * callers must not interpret an accounting failure as zero spend.
+   */
+  getMonthlyUsageByClient(now: number = Date.now()): Map<string, number> {
+    const rows = this.db
+      .query(
+        `SELECT client, SUM(sats_cost) AS sats
+           FROM usage_tracking
+          WHERE timestamp >= ? AND client IS NOT NULL
+          GROUP BY client`,
+      )
+      .all(monthStart(now)) as Array<{ client: string; sats: number }>;
+
+    const usage = new Map<string, number>();
+    for (const row of rows) {
+      if (!row.client) continue;
+      const sats = Number(row.sats);
+      if (!Number.isFinite(sats)) throw new Error("Invalid monthly usage total");
+      usage.set(row.client, sats);
+    }
+    return usage;
+  }
+
+  /**
+   * Current-month sats spent per npub.
+   *
+   * Usage rows only carry a client id. The owning npub comes from the client's
+   * `ownerNpub`, falling back to the 7-character npub suffix the auth proxy
+   * appends to every client id. The fallback keeps spend attributed after a
+   * client is deleted and re-created under a new id.
+   */
+  getMonthlyUsageByNpub(now: number = Date.now()): Map<string, number> {
+    const usage = this.getMonthlyUsageByClient(now);
+    if (usage.size === 0) return new Map();
+
+    const suffixToNpub = new Map<string, string>();
+    for (const entry of this.listNpubs()) {
+      suffixToNpub.set(entry.npub.slice(-7), entry.npub);
+    }
+
+    const ownerByClient = new Map<string, string | null>();
+    for (const client of this.getClients()) {
+      ownerByClient.set(client.clientId, client.ownerNpub ?? null);
+    }
+
+    const byNpub = new Map<string, number>();
+    for (const [clientId, sats] of usage) {
+      const owner =
+        ownerByClient.get(clientId) ?? suffixToNpub.get(clientId.slice(-7));
+      if (!owner) continue;
+      byNpub.set(owner, (byNpub.get(owner) ?? 0) + sats);
+    }
+    return byNpub;
   }
 
   removeNpub(pubkey: string): boolean {
