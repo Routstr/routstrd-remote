@@ -1,3 +1,8 @@
+[0.1.35]
+* Security: the image is rebuilt on cloudron/base 6.0.1 (Ubuntu 26.04) instead of 5.0.0 (Ubuntu 24.04). That removes 119 of the 133 critical vulnerabilities the old base carried (php8.3 extensions, kernel headers, MongoDB tools, Node's bundled tar, gosu). The 14 that remain are all inherited from Cloudron's base image and none come from this app; each is recorded with a justification and an expiry date in the repo, so the release pipeline refuses to ship a new one
+* System packages come from the refreshed base (glibc 2.43, OpenSSL, curl, CA roots), and the image is less than half its previous size (2.87 GB to 1.34 GB) because the base no longer ships Node.js, which the app never used
+* Releases are now gated: the publish script builds the image, scans it with Trivy and only then pushes, so an image with an unaccepted critical vulnerability cannot be published or registered in the Cloudron catalog
+
 [0.1.33]
 * Security: the image now runs Bun 1.4.4, whose bundled CA roots no longer include the compromised "emSign ECC Root CA - G3" and "AAA Certificate Services" roots. The daemon used to complete TLS handshakes with certificates chaining to those roots; browsers blocked them, but the daemon does not check revocation, so outbound calls to a forged endpoint could be intercepted. Those chains now fail to verify
 * The system CA bundle in the image was refreshed at the same time and no longer carries the compromised roots either, so anything else in the container that uses the OS trust store is covered too
