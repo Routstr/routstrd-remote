@@ -631,6 +631,16 @@ export class AuthProxy {
       return this.handleUsage(req);
     }
 
+    // `/usage` and `/usage/summary` are served above with the caller's npub
+    // injected so the daemon scopes rows to that identity. Every other
+    // `/usage*` path -- notably the daemon's unscoped `/usagePi`, which returns
+    // all clients' rows for a given second -- is refused here rather than
+    // forwarded, so it cannot step around that scoping. routstrd removes the
+    // route itself; this guard also covers daemons that still ship it.
+    if (path.startsWith("/usage")) {
+      return this.json({ error: "Not found." }, 404);
+    }
+
     // Reads only: the daemon routes a POST to these paths as a paid request.
     const isPublicPath =
       (req.method === "GET" || req.method === "HEAD") &&

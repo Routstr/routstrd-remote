@@ -213,8 +213,8 @@ The helper creates `Authorization: Nostr <base64-event>` headers whose signed ev
 
 ## Auth behaviour
 
-- **Public endpoints** (health, models, balance, etc.) — forwarded immediately, no token needed.
-- **Forwarded endpoints** — client API keys (`Bearer` or `x-api-key`) are limited to the method/path pairs Routstr Core's own allowlist forwards (`_ALLOWED_ENDPOINTS` in core's `routstr/proxy.py`); anything else is a `403`. Registered npubs retain signed daemon access, while wallet sends and provider API-key listing/deletion require an admin npub.
+- **Public endpoints** (`/health`, `/ping`, `/models`, `/v1/models`, and the `/models/*`, `/v1/models/*` prefixes) — forwarded immediately, no token needed. Balance routes are **not** public: they need a registered-npub NIP-98 identity.
+- **Forwarded endpoints** — client API keys (`Bearer` or `x-api-key`) are limited to the method/path pairs Routstr Core's own allowlist forwards (`_ALLOWED_ENDPOINTS` in core's `routstr/proxy.py`); anything else is a `403`. That covers the inference routes (`chat/completions`, `completions`, `responses`, `messages`, `messages/count_tokens`, `embeddings`, `systemone`, `decisions`) and the image routes. Daemon state and control routes — `GET /balance`, `/keys/balance`, `/providers`, `/cooldowns`, `/status`, `/version`, `/settings/*`, `/wallet/*`, `/requests/*` — are npub-only. Registered npubs retain signed daemon access, while wallet sends and provider API-key listing/deletion require an admin npub.
 - **Registered npubs** — stored in the shared `routstr.db` table `routstr_auth_npubs`. Env-configured admins are bootstrapped into that table at startup.
 - **List npubs** — `GET /npubs` returns `{ "npubs": [...] }` with each npub's `npub`, `name`, and `role`. Requires NIP-98 auth from a registered npub.
 - **Add npubs** — `POST /npubs` with `{ "npub": "npub1..." }` or `{ "pubkey": "<64-char hex>" }`, optionally `{ "role": "user", "name": "Alice" }`. If no npubs are configured yet, this first add is unauthenticated; after that it requires NIP-98 auth from an existing admin. Duplicate npubs return `409`; use `PATCH /npubs` to update an existing entry.

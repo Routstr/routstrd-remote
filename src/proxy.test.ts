@@ -939,6 +939,37 @@ describe("daemon route capability boundary", () => {
     );
   });
 
+  it("refuses unscoped usage paths instead of forwarding them", async () => {
+    const secretKey = registerNpub("user");
+    const paths = [
+      "/usagePi",
+      "/usagePi?timestamp=1750000000",
+      "/usage/raw",
+    ];
+
+    for (const path of paths) {
+      // A registered npub would otherwise be forwarded straight to the daemon,
+      // which answers without applying the `npub` filter the proxy injects.
+      const signed = await proxy.handle(
+        await signedRequest(secretKey, "GET", path),
+      );
+      expect(signed.status).toBe(404);
+
+      const bearer = await proxy.handle(clientRequest("GET", path));
+      expect(bearer.status).toBe(404);
+    }
+    expect(upstream.calls).toHaveLength(0);
+
+    // The scoped routes are untouched: they still reach the daemon, with the
+    // caller's npub on the query string.
+    const scoped = await proxy.handle(
+      await signedRequest(secretKey, "GET", "/usage"),
+    );
+    expect(scoped.status).toBe(200);
+    expect(upstream.calls).toHaveLength(1);
+    expect(upstream.calls[0]!.url).toContain("npub=npub1");
+  });
+
   it("requires admin NIP-98 for provider keys and wallet sends", async () => {
     const userSecret = registerNpub("user");
     const adminSecret = registerNpub("admin");
