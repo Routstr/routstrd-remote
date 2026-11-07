@@ -888,6 +888,13 @@ describe("daemon route capability boundary", () => {
       ["POST", "/v1/chat/completions/admin", "bearer"],
       ["POST", "/v1//chat/completions", "bearer"],
       ["POST", "/v1/chat/completions//", "bearer"],
+      // Core allows GET only on `models`, and omits attestation entirely.
+      ["POST", "/v1/models", "bearer"],
+      ["POST", "/v1/attestation", "bearer"],
+      ["GET", "/v1/tee/attestation", "bearer"],
+      // Prototype keys must not resolve through the capability table.
+      ["POST", "/v1/constructor", "bearer"],
+      ["POST", "/v1/toString", "bearer"],
     ] as const;
 
     for (const [method, path, carrier] of routes) {
@@ -895,6 +902,28 @@ describe("daemon route capability boundary", () => {
       expect(res.status).toBe(403);
     }
     expect(upstream.calls).toHaveLength(0);
+  });
+
+  it("scopes methods per endpoint the way Routstr Core does", () => {
+    // Source of truth: _ALLOWED_ENDPOINTS in routstr-core/routstr/proxy.py.
+    expect(AuthProxy.isInferencePath("GET", "/v1/models")).toBe(true);
+    expect(AuthProxy.isInferencePath("get", "/models")).toBe(true);
+    expect(AuthProxy.isInferencePath("POST", "/v1/models")).toBe(false);
+    expect(AuthProxy.isInferencePath("POST", "/v1/embeddings")).toBe(true);
+    expect(AuthProxy.isInferencePath("GET", "/v1/embeddings")).toBe(false);
+    expect(AuthProxy.isInferencePath("PUT", "/v1/images/generations")).toBe(false);
+    expect(AuthProxy.isInferencePath("GET", "/v1/attestation")).toBe(false);
+    expect(AuthProxy.isInferencePath("GET", "/v1/tee/attestation")).toBe(false);
+    // A Map lookup, so inherited object keys cannot satisfy the table.
+    expect(AuthProxy.isInferencePath("POST", "/v1/constructor")).toBe(false);
+    expect(AuthProxy.isInferencePath("POST", "/v1/hasOwnProperty")).toBe(false);
+    // Canonicalization matches core: one trailing slash and one `v1/` prefix.
+    expect(AuthProxy.canonicalApiPath("/v1/messages/count_tokens/")).toBe(
+      "messages/count_tokens",
+    );
+    expect(AuthProxy.canonicalApiPath("/messages/count_tokens")).toBe(
+      "messages/count_tokens",
+    );
   });
 
   it("requires admin NIP-98 for provider keys and wallet sends", async () => {

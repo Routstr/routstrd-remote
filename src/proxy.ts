@@ -761,23 +761,47 @@ export class AuthProxy {
     "/keys/api/delete",
   ]);
 
-  /** Keep aligned with Routstr Core's credential-safe POST endpoints. */
-  static INFERENCE_PATHS = new Set([
-    "chat/completions",
-    "completions",
-    "responses",
-    "messages",
-    "messages/count_tokens",
-    "embeddings",
-    "systemone",
-    "decisions",
-    "images/generations",
-    "images/edits",
-    "images/variations",
-    "image/generate",
-    "image/edit",
-    "image/inpaint",
-    "image/upscale",
+  /**
+   * Mirror of Routstr Core's `_ALLOWED_ENDPOINTS` (routstr/proxy.py), which is
+   * the authoritative gate for which method/path pairs may reach an upstream
+   * with the provider credential attached. Core refuses everything outside that
+   * table, so anything listed there is safe for a client key to reach and
+   * anything missing there is dead weight here. Keep the two tables in sync.
+   *
+   * Deliberate differences from core:
+   * - `attestation` / `tee/attestation` are omitted. Core forwards those
+   *   unauthenticated (`_select_unauthenticated_get_upstreams`), so they belong
+   *   in `PUBLIC_PATHS`, not in a client-key capability list.
+   * - `models` is listed for parity, but `PUBLIC_PATHS` already covers it, so a
+   *   GET never reaches the client-key branch. It is GET-only here exactly as
+   *   in core, which is why `POST /v1/models` stays a 403.
+   *
+   * Core also accepts operator additions via `PROXY_EXTRA_ALLOWED_PATHS`; this
+   * proxy has no equivalent and rejects anything not listed below.
+   */
+  static INFERENCE_ENDPOINTS: ReadonlyMap<string, ReadonlySet<string>> = new Map<
+    string,
+    ReadonlySet<string>
+  >([
+    ["chat/completions", new Set(["POST"])],
+    ["completions", new Set(["POST"])],
+    ["responses", new Set(["POST"])],
+    ["messages", new Set(["POST"])],
+    // Anthropic token counting. Core's allowlist is exact, so the `messages`
+    // entry above does not carry it; Claude Code and the Anthropic SDKs call it
+    // before every request.
+    ["messages/count_tokens", new Set(["POST"])],
+    ["embeddings", new Set(["POST"])],
+    ["systemone", new Set(["POST"])],
+    ["decisions", new Set(["POST"])],
+    ["images/generations", new Set(["POST"])],
+    ["images/edits", new Set(["POST"])],
+    ["images/variations", new Set(["POST"])],
+    ["image/generate", new Set(["POST"])],
+    ["image/edit", new Set(["POST"])],
+    ["image/inpaint", new Set(["POST"])],
+    ["image/upscale", new Set(["POST"])],
+    ["models", new Set(["GET"])],
   ]);
 
   static isPublicPath(path: string): boolean {
@@ -789,11 +813,24 @@ export class AuthProxy {
     return AuthProxy.ADMIN_PATHS.has(path);
   }
 
-  static isInferencePath(method: string, path: string): boolean {
-    if (method !== "POST") return false;
+  /**
+   * Canonicalize a request path the way core's `_canonical_api_path` does:
+   * drop one trailing slash, then a leading `v1/`. Callers must screen for
+   * ambiguous spellings first; `/v1//x` and friends are rejected upstream of
+   * this.
+   */
+  static canonicalApiPath(path: string): string {
     let route = path.slice(1);
     if (route.endsWith("/")) route = route.slice(0, -1);
     if (route.startsWith("v1/")) route = route.slice(3);
-    return AuthProxy.INFERENCE_PATHS.has(route);
+    return route;
+  }
+
+  static isInferencePath(method: string, path: string): boolean {
+    return (
+      AuthProxy.INFERENCE_ENDPOINTS.get(
+        AuthProxy.canonicalApiPath(path),
+      )?.has(method.toUpperCase()) ?? false
+    );
   }
 }
