@@ -770,6 +770,14 @@ export class AuthProxy {
     "messages/count_tokens",
     "embeddings",
     "systemone",
+    "decisions",
+    "images/generations",
+    "images/edits",
+    "images/variations",
+    "image/generate",
+    "image/edit",
+    "image/inpaint",
+    "image/upscale",
   ]);
 
   static isPublicPath(path: string): boolean {

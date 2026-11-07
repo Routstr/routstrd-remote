@@ -782,6 +782,14 @@ describe("daemon route capability boundary", () => {
     "messages/count_tokens",
     "embeddings",
     "systemone",
+    "decisions",
+    "images/generations",
+    "images/edits",
+    "images/variations",
+    "image/generate",
+    "image/edit",
+    "image/inpaint",
+    "image/upscale",
   ];
   let tmp: { dbPath: string; cleanup: () => void };
   let upstream: ReturnType<typeof mockFetchUpstream>;
