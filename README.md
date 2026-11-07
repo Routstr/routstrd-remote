@@ -35,17 +35,19 @@ Starting the auth proxy does **not** automatically register the identity in `con
 
 ```bash
 # From inside the container (or its Cloudron terminal)
-routstrd npubs register
+routstrd npubs register --name "Alice"
 
 # Alternatively, from the Docker host
-docker exec -it <container> routstrd npubs register
+docker exec -it <container> routstrd npubs register --name "Alice"
 ```
+
+A display name is required — it is how the admin list tells identities apart. Omit `--name` on a terminal and the CLI prompts for it; in a script, pass it explicitly. The proxy rejects a registration that carries no name, so if `--name` is not recognised, update the CLI first (`npm i -g routstrd@latest`).
 
 No npub argument is needed: the CLI derives your npub from the `nsec` in its selected `config.json`. Inside the container this uses the container identity; on another machine it uses that machine's configured identity and auth URL.
 
 When no npubs are registered, `GET /npubs` accepts a valid NIP-98 request so the CLI can check the empty list before registering. The first `POST /npubs` is unauthenticated and defaults to admin; later additions require an existing admin. This bootstrap is **not container-only**: anyone who can reach the endpoint can claim the first-admin slot while the store is empty. Restrict access until registration is complete.
 
-If an admin is already configured (including via `ROUTSTRD_AUTH_ADMIN_*`), use that admin to add other identities with `routstrd npubs add <npub>`.
+If an admin is already configured (including via `ROUTSTRD_AUTH_ADMIN_*`), use that admin to add other identities with `routstrd npubs add <npub> --name "Bob"`.
 
 ## Cloudron
 
@@ -61,7 +63,7 @@ bun i -g routstrd
 routstrd remote <cloudron-url>
 
 # Register yourself as the first admin (first npub gets admin by default)
-routstrd npubs register
+routstrd npubs register --name "Alice"
 ```
 
 That's it — you now have full access to routstrd on Cloudron. Integrate it with your coding agents:
@@ -79,7 +81,7 @@ Anyone joining an existing routstrd Cloudron instance does the same initial step
 1. `bun i -g routstrd` — install the CLI
 2. `routstrd remote <cloudron-url>` — connect to the instance (this generates a unique npub for the new person)
 3. Give that npub to someone who already has access
-4. That person runs: `routstrd npubs add <npub>` — grants access
+4. That person runs: `routstrd npubs add <npub> --name "Bob"` — grants access
 5. The new member can now add clients (e.g. `routstrd clients add --claude-code`) and start using routstrd
 
 ### Tracking Usage
@@ -215,10 +217,10 @@ The helper creates `Authorization: Nostr <base64-event>` headers whose signed ev
 
 - **Public endpoints** (health, models, balance, etc.) — forwarded immediately, no token needed.
 - **Protected endpoints** — require a valid `Bearer` token that exists in the shared DB.
-- **Registered npubs** — stored in the shared `routstr.db` table `routstr_auth_npubs`. Env-configured admins are bootstrapped into that table at startup.
+- **Registered npubs** — stored in the shared `routstr.db` table `routstr_auth_npubs`. Env-configured admins are bootstrapped into that table at startup, without a display name.
 - **List npubs** — `GET /npubs` returns `{ "npubs": [...] }` with each npub's `npub`, `name`, and `role`. Requires NIP-98 auth from a registered npub.
-- **Add npubs** — `POST /npubs` with `{ "npub": "npub1..." }` or `{ "pubkey": "<64-char hex>" }`, optionally `{ "role": "user", "name": "Alice" }`. If no npubs are configured yet, this first add is unauthenticated; after that it requires NIP-98 auth from an existing admin. Duplicate npubs return `409`; use `PATCH /npubs` to update an existing entry.
-- **Update npubs** — `PATCH /npubs` with `{ "npub": "npub1..." }` or `{ "pubkey": "<64-char hex>" }` plus `role` and/or `name`. Requires NIP-98 auth from an existing admin. Set `name` to `null` to clear it.
+- **Add npubs** — `POST /npubs` with `{ "npub": "npub1...", "name": "Alice" }` or `{ "pubkey": "<64-char hex>", "name": "Alice" }`, optionally `{ "role": "user" }`. `name` is **required** (1–64 characters); a request without it returns `400` with `field: "name"`. If no npubs are configured yet, this first add is unauthenticated; after that it requires NIP-98 auth from an existing admin. Duplicate npubs return `409`; use `PATCH /npubs` to update an existing entry.
+- **Update npubs** — `PATCH /npubs` with `{ "npub": "npub1..." }` or `{ "pubkey": "<64-char hex>" }` plus `role` and/or `name`. Requires NIP-98 auth from an existing admin. A name can be replaced but not cleared: `name: null` and whitespace-only values return `400`, so an entry cannot be left unnamed. This is also how npubs bootstrapped from `ROUTSTRD_AUTH_ADMIN_*` get a name.
 - **Remove npubs** — `DELETE /npubs/<npub-or-pubkey>` (or `DELETE /npubs?npub=...`) requires NIP-98 auth from an existing admin.
 - **Forwarded headers** — the proxy strips `Authorization` and injects `x-routstr-client-id` so the daemon knows which client made the request.
 

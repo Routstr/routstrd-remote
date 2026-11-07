@@ -189,6 +189,15 @@ export class AuthStore {
     return this.countNpubs("admin");
   }
 
+  /**
+   * Npubs with no display name. Only rows bootstrapped from the environment or
+   * migrated from the legacy admin table can be unnamed: the API requires a
+   * name on creation and refuses to clear one.
+   */
+  listUnnamedNpubs(): NpubEntry[] {
+    return this.listNpubs().filter((entry) => entry.name === null);
+  }
+
   countNpubs(role?: NpubRole): number {
     const where = role ? " WHERE role = ?" : "";
     const params = role ? [role] : [];

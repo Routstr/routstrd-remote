@@ -3,6 +3,26 @@ import { validateNIP98Request } from "./nip98";
 import { requestAuthorization } from "./auth";
 import { type Client, type NpubRole, AuthStore } from "./store";
 
+interface ParseNpubOptions {
+  /** Reject a body that does not carry a usable display name (npub creation). */
+  requireName?: boolean;
+  /** Reject an explicit attempt to clear the name (npub updates). */
+  forbidNameClear?: boolean;
+}
+
+/**
+ * Display names are mandatory when an npub is registered, so the admin list
+ * always says who an identity belongs to. The message names the CLI flag and
+ * the upgrade path, because an older `routstrd` cannot send `--name` at all.
+ */
+const NPUB_NAME_REQUIRED_ERROR =
+  "Missing required field 'name'. Provide a display name (1-64 characters), " +
+  "e.g. routstrd npubs add <npub> --name \"Alice\". If your routstrd does not " +
+  "support --name, update it first ('npm i -g routstrd@latest').";
+
+const NPUB_NAME_CLEAR_ERROR =
+  "Invalid name. A display name cannot be removed; provide a new name (1-64 characters).";
+
 /**
  * Thin proxy that validates Bearer tokens or NIP-98 Nostr HTTP auth events and
  * forwards requests to the routstrd daemon running on localhost only.
@@ -73,6 +93,7 @@ export class AuthProxy {
 
   private parseNpubBody(
     raw: unknown,
+    options: ParseNpubOptions = {},
   ): { pubkey: string; role?: NpubRole; name?: string | null } | Response {
     if (raw === undefined || raw === null || (ArrayBuffer.isView(raw) && (raw as ArrayBufferView).byteLength === 0)) {
       return this.json({ error: "Request body is required. Provide { \"npub\": \"npub1...\" } or { \"pubkey\": \"<64-char hex>\" }." }, 400);
@@ -91,14 +112,17 @@ export class AuthProxy {
       } catch {
         return this.json({ error: "Invalid JSON body." }, 400);
       }
-      return this.extractNpub(parsed);
+      return this.extractNpub(parsed, options);
     }
 
     // Accept already-parsed JSON object
-    return this.extractNpub(raw);
+    return this.extractNpub(raw, options);
   }
 
-  private extractNpub(parsed: unknown): { pubkey: string; role?: NpubRole; name?: string | null } | Response {
+  private extractNpub(
+    parsed: unknown,
+    options: ParseNpubOptions = {},
+  ): { pubkey: string; role?: NpubRole; name?: string | null } | Response {
     const value = typeof parsed === "string"
       ? parsed
       : parsed && typeof parsed === "object"
@@ -141,6 +165,15 @@ export class AuthProxy {
           return this.json({ error: "Invalid name. Expected a string or null." }, 400);
         }
       }
+    }
+
+    // Creating an npub requires a name so every entry in the admin list is
+    // attributable to a person. Clearing one is refused for the same reason.
+    if (options.requireName && (result.name === undefined || result.name === null)) {
+      return this.json({ error: NPUB_NAME_REQUIRED_ERROR, field: "name" }, 400);
+    }
+    if (options.forbidNameClear && result.name === null) {
+      return this.json({ error: NPUB_NAME_CLEAR_ERROR, field: "name" }, 400);
     }
 
     return result;
@@ -501,7 +534,7 @@ export class AuthProxy {
         createdBy = auth.pubkey;
       }
 
-      const parsed = this.parseNpubBody(body);
+      const parsed = this.parseNpubBody(body, { requireName: true });
       if (parsed instanceof Response) return parsed;
 
       // Bootstrap the very first registered npub as admin by default. After
@@ -571,7 +604,7 @@ export class AuthProxy {
       );
       if (auth instanceof Response) return auth;
 
-      const parsed = this.parseNpubBody(body);
+      const parsed = this.parseNpubBody(body, { forbidNameClear: true });
       if (parsed instanceof Response) return parsed;
 
       if (!parsed.role && parsed.name === undefined) {
@@ -736,6 +769,17 @@ export class AuthProxy {
       console.warn(
         "  Warning: no registered npub/pubkey. " +
           "The first admin can be registered without auth using POST /npubs.",
+      );
+    }
+
+    const unnamed = this.store.listUnnamedNpubs();
+    if (unnamed.length > 0) {
+      const shown = unnamed.slice(0, 5).map((entry) => entry.npub.slice(-9)).join(", ");
+      const more = unnamed.length > 5 ? ` (+${unnamed.length - 5} more)` : "";
+      console.warn(
+        `  Warning: ${unnamed.length} npub(s) have no display name: ${shown}${more}. ` +
+          "They were bootstrapped from ROUTSTRD_AUTH_ADMIN_* or migrated from the " +
+          "legacy admin table. Set one with: routstrd npubs update <npub> --name \"Alice\"",
       );
     }
 
