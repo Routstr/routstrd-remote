@@ -613,6 +613,12 @@ export class AuthProxy {
     const path = url.pathname;
     const authorization = requestAuthorization(req);
 
+    // Bun preserves leading `//` inbound but collapses it on outbound fetch,
+    // which would make exact path authorization and the daemon disagree.
+    if (path.startsWith("//")) {
+      return this.json({ error: "Invalid request path." }, 400);
+    }
+
     if (path === "/npubs" || path.startsWith("/npubs/")) {
       return this.handleNpubs(req, path);
     }
@@ -646,10 +652,9 @@ export class AuthProxy {
 
     const bearerMatch = authorization.match(/^Bearer\s+(.+)$/i);
     if (bearerMatch) {
-      // API key: block /clients/add and wallet endpoints
-      if (AuthProxy.isRestrictedPath(path)) {
+      if (!AuthProxy.isInferencePath(req.method, path)) {
         return this.json({
-          error: "API keys cannot access this endpoint. Use NIP-98 auth from a registered npub/pubkey.",
+          error: "API keys can access inference endpoints only. Use NIP-98 auth with the required role.",
         }, 403);
       }
 
@@ -663,10 +668,7 @@ export class AuthProxy {
       // so we can inspect the `model` field. When disabled, keep the
       // original streaming body to avoid the buffering latency.
       let body: Uint8Array | undefined;
-      if (
-        this.config.modelAllowlistEnabled &&
-        (req.method === "POST" || req.method === "PUT" || req.method === "PATCH")
-      ) {
+      if (this.config.modelAllowlistEnabled) {
         body = new Uint8Array(await req.arrayBuffer());
       }
 
@@ -686,29 +688,13 @@ export class AuthProxy {
           ? undefined
           : new Uint8Array(await req.arrayBuffer());
 
-      // Determine required role first to generate the right error message
-      if (AuthProxy.isAdminPath(path)) {
-        const auth = await this.authenticateNpub(req, authorization, body, "admin");
-        if (auth instanceof Response) return auth;
-
-        const blocked = this.checkModelAllowlist(body, req.method);
-        if (blocked) return blocked;
-
-        return this.forward(req, body);
-      }
-
-      if (AuthProxy.isNpubRestrictedPath(path)) {
-        const auth = await this.authenticateNpub(req, authorization, body, "user");
-        if (auth instanceof Response) return auth;
-
-        const blocked = this.checkModelAllowlist(body, req.method);
-        if (blocked) return blocked;
-
-        return this.forward(req, body);
-      }
-
-      // Default: any registered npub can access
-      const auth = await this.authenticateNpub(req, authorization, body, "user");
+      const requiredRole = AuthProxy.isAdminPath(path) ? "admin" : "user";
+      const auth = await this.authenticateNpub(
+        req,
+        authorization,
+        body,
+        requiredRole,
+      );
       if (auth instanceof Response) return auth;
 
       const blocked = this.checkModelAllowlist(body, req.method);
@@ -799,25 +785,51 @@ export class AuthProxy {
   static ADMIN_PATHS = new Set([
     "/wallet/send/cashu",
     "/wallet/send/bolt11",
+    "/keys/api",
+    "/keys/api/delete",
   ]);
 
-  /** Endpoints restricted to registered npubs (admin + user). API keys cannot access. */
-  static NPUB_RESTRICTED_PATHS = new Set([
-    "/wallet/status",
-    "/wallet/unlock",
-    "/wallet/balance",
-    "/wallet/receive/cashu",
-    "/wallet/receive/bolt11",
-    "/wallet/mints",
-    "/wallet/mints/info",
-    // Daemon control: an API key buys inference, nothing more. /providers is
-    // here because ?refresh=true rewrites the stored provider list.
-    "/stop",
-    "/refund",
-    "/refund/xcashu",
-    "/providers",
-    "/providers/enable",
-    "/providers/disable",
+  /**
+   * Mirror of Routstr Core's `_ALLOWED_ENDPOINTS` (routstr/proxy.py), which is
+   * the authoritative gate for which method/path pairs may reach an upstream
+   * with the provider credential attached. Core refuses everything outside that
+   * table, so anything listed there is safe for a client key to reach and
+   * anything missing there is dead weight here. Keep the two tables in sync.
+   *
+   * Deliberate differences from core:
+   * - `attestation` / `tee/attestation` are omitted. Core forwards those
+   *   unauthenticated (`_select_unauthenticated_get_upstreams`), so they belong
+   *   in `PUBLIC_PATHS`, not in a client-key capability list.
+   * - `models` is listed for parity, but `PUBLIC_PATHS` already covers it, so a
+   *   GET never reaches the client-key branch. It is GET-only here exactly as
+   *   in core, which is why `POST /v1/models` stays a 403.
+   *
+   * Core also accepts operator additions via `PROXY_EXTRA_ALLOWED_PATHS`; this
+   * proxy has no equivalent and rejects anything not listed below.
+   */
+  static INFERENCE_ENDPOINTS: ReadonlyMap<string, ReadonlySet<string>> = new Map<
+    string,
+    ReadonlySet<string>
+  >([
+    ["chat/completions", new Set(["POST"])],
+    ["completions", new Set(["POST"])],
+    ["responses", new Set(["POST"])],
+    ["messages", new Set(["POST"])],
+    // Anthropic token counting. Core's allowlist is exact, so the `messages`
+    // entry above does not carry it; Claude Code and the Anthropic SDKs call it
+    // before every request.
+    ["messages/count_tokens", new Set(["POST"])],
+    ["embeddings", new Set(["POST"])],
+    ["systemone", new Set(["POST"])],
+    ["decisions", new Set(["POST"])],
+    ["images/generations", new Set(["POST"])],
+    ["images/edits", new Set(["POST"])],
+    ["images/variations", new Set(["POST"])],
+    ["image/generate", new Set(["POST"])],
+    ["image/edit", new Set(["POST"])],
+    ["image/inpaint", new Set(["POST"])],
+    ["image/upscale", new Set(["POST"])],
+    ["models", new Set(["GET"])],
   ]);
 
   static isPublicPath(path: string): boolean {
@@ -829,11 +841,24 @@ export class AuthProxy {
     return AuthProxy.ADMIN_PATHS.has(path);
   }
 
-  static isNpubRestrictedPath(path: string): boolean {
-    return AuthProxy.NPUB_RESTRICTED_PATHS.has(path) || path.startsWith("/nwc/");
+  /**
+   * Canonicalize a request path the way core's `_canonical_api_path` does:
+   * drop one trailing slash, then a leading `v1/`. Callers must screen for
+   * ambiguous spellings first; `/v1//x` and friends are rejected upstream of
+   * this.
+   */
+  static canonicalApiPath(path: string): string {
+    let route = path.slice(1);
+    if (route.endsWith("/")) route = route.slice(0, -1);
+    if (route.startsWith("v1/")) route = route.slice(3);
+    return route;
   }
 
-  static isRestrictedPath(path: string): boolean {
-    return this.isAdminPath(path) || this.isNpubRestrictedPath(path);
+  static isInferencePath(method: string, path: string): boolean {
+    return (
+      AuthProxy.INFERENCE_ENDPOINTS.get(
+        AuthProxy.canonicalApiPath(path),
+      )?.has(method.toUpperCase()) ?? false
+    );
   }
 }

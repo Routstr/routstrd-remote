@@ -785,3 +785,216 @@ describe("Model Allowlist Enforcement (AUTH-001)", () => {
     });
   });
 });
+
+describe("daemon route capability boundary", () => {
+  const inferenceFamilies = [
+    "chat/completions",
+    "completions",
+    "responses",
+    "messages",
+    "messages/count_tokens",
+    "embeddings",
+    "systemone",
+    "decisions",
+    "images/generations",
+    "images/edits",
+    "images/variations",
+    "image/generate",
+    "image/edit",
+    "image/inpaint",
+    "image/upscale",
+  ];
+  let tmp: { dbPath: string; cleanup: () => void };
+  let upstream: ReturnType<typeof mockFetchUpstream>;
+  let proxy: AuthProxy;
+
+  beforeEach(() => {
+    tmp = createTmpDb();
+    setClients(tmp.dbPath, [TEST_CLIENT]);
+    upstream = mockFetchUpstream();
+    proxy = new AuthProxy(
+      makeConfig(tmp.dbPath, { modelAllowlistEnabled: false }),
+    );
+  });
+
+  afterEach(() => {
+    proxy.close();
+    upstream.restore();
+    tmp.cleanup();
+  });
+
+  function registerNpub(role: "admin" | "user"): Uint8Array {
+    const secretKey = generateSecretKey();
+    const store = new AuthStore(tmp.dbPath);
+    store.addNpub(getPublicKey(secretKey), role, null);
+    store.close();
+    return secretKey;
+  }
+
+  async function signedRequest(
+    secretKey: Uint8Array,
+    method: string,
+    path: string,
+    bodyText?: string,
+  ): Promise<Request> {
+    const body = bodyText === undefined
+      ? undefined
+      : new TextEncoder().encode(bodyText);
+    const url = `http://localhost:8008${path}`;
+    const unsigned = new Request(url, { method, body });
+    const authorization = await nip98Authorization(secretKey, unsigned, body);
+    return new Request(url, {
+      method,
+      headers: { Authorization: authorization },
+      body,
+    });
+  }
+
+  function clientRequest(
+    method: string,
+    path: string,
+    carrier: "bearer" | "x-api-key" = "bearer",
+  ): Request {
+    const body = method === "GET" || method === "HEAD"
+      ? undefined
+      : JSON.stringify({ model: "routstr/test" });
+    const headers = carrier === "bearer"
+      ? { Authorization: `Bearer ${TEST_API_KEY}` }
+      : { "x-api-key": TEST_API_KEY };
+    return new Request(`http://localhost:8008${path}`, {
+      method,
+      headers,
+      body,
+    });
+  }
+
+  it("allows the complete client inference contract", async () => {
+    const paths = [
+      ...inferenceFamilies.map((family) => `/v1/${family}`),
+      "/chat/completions",
+      "/v1/chat/completions/",
+    ];
+
+    for (const path of paths) {
+      expect((await proxy.handle(clientRequest("POST", path))).status).toBe(200);
+    }
+    expect(upstream.calls).toHaveLength(paths.length);
+    expect(upstream.calls.every(
+      (call) => call.headers.get("authorization") === `Bearer ${TEST_API_KEY}`,
+    )).toBe(true);
+
+    const anthropic = await proxy.handle(
+      clientRequest("POST", "/v1/messages/count_tokens", "x-api-key"),
+    );
+    expect(anthropic.status).toBe(200);
+    expect(upstream.calls.at(-1)!.headers.get("x-api-key")).toBe(TEST_API_KEY);
+    expect(upstream.calls.at(-1)!.headers.get("authorization")).toBeNull();
+  });
+
+  it("blocks client keys from non-inference routes", async () => {
+    const routes = [
+      ["GET", "/keys/api", "bearer"],
+      ["GET", "/keys/api?include=all", "x-api-key"],
+      ["DELETE", "/keys/api/delete?baseUrl=https%3A%2F%2Fprovider.invalid", "bearer"],
+      ["POST", "/future/admin", "bearer"],
+      ["GET", "/v1/chat/completions", "bearer"],
+      ["POST", "/v1/chat/completions/admin", "bearer"],
+      ["POST", "/v1//chat/completions", "bearer"],
+      ["POST", "/v1/chat/completions//", "bearer"],
+      // Core allows GET only on `models`, and omits attestation entirely.
+      ["POST", "/v1/models", "bearer"],
+      ["POST", "/v1/attestation", "bearer"],
+      ["GET", "/v1/tee/attestation", "bearer"],
+      // Prototype keys must not resolve through the capability table.
+      ["POST", "/v1/constructor", "bearer"],
+      ["POST", "/v1/toString", "bearer"],
+    ] as const;
+
+    for (const [method, path, carrier] of routes) {
+      const res = await proxy.handle(clientRequest(method, path, carrier));
+      expect(res.status).toBe(403);
+    }
+    expect(upstream.calls).toHaveLength(0);
+  });
+
+  it("scopes methods per endpoint the way Routstr Core does", () => {
+    // Source of truth: _ALLOWED_ENDPOINTS in routstr-core/routstr/proxy.py.
+    expect(AuthProxy.isInferencePath("GET", "/v1/models")).toBe(true);
+    expect(AuthProxy.isInferencePath("get", "/models")).toBe(true);
+    expect(AuthProxy.isInferencePath("POST", "/v1/models")).toBe(false);
+    expect(AuthProxy.isInferencePath("POST", "/v1/embeddings")).toBe(true);
+    expect(AuthProxy.isInferencePath("GET", "/v1/embeddings")).toBe(false);
+    expect(AuthProxy.isInferencePath("PUT", "/v1/images/generations")).toBe(false);
+    expect(AuthProxy.isInferencePath("GET", "/v1/attestation")).toBe(false);
+    expect(AuthProxy.isInferencePath("GET", "/v1/tee/attestation")).toBe(false);
+    // A Map lookup, so inherited object keys cannot satisfy the table.
+    expect(AuthProxy.isInferencePath("POST", "/v1/constructor")).toBe(false);
+    expect(AuthProxy.isInferencePath("POST", "/v1/hasOwnProperty")).toBe(false);
+    // Canonicalization matches core: one trailing slash and one `v1/` prefix.
+    expect(AuthProxy.canonicalApiPath("/v1/messages/count_tokens/")).toBe(
+      "messages/count_tokens",
+    );
+    expect(AuthProxy.canonicalApiPath("/messages/count_tokens")).toBe(
+      "messages/count_tokens",
+    );
+  });
+
+  it("requires admin NIP-98 for provider keys and wallet sends", async () => {
+    const userSecret = registerNpub("user");
+    const adminSecret = registerNpub("admin");
+    const routes = [
+      ["GET", "/keys/api?include=all", undefined],
+      ["POST", "/keys/api/delete", JSON.stringify({ baseUrl: "https://provider.invalid" })],
+      ["DELETE", "/keys/api/delete?baseUrl=https%3A%2F%2Fprovider.invalid", undefined],
+      ["POST", "/wallet/send/cashu", "{}"],
+      ["POST", "/wallet/send/bolt11", "{}"],
+    ] as const;
+
+    for (const [method, path, body] of routes) {
+      const denied = await proxy.handle(
+        await signedRequest(userSecret, method, path, body),
+      );
+      expect(denied.status).toBe(403);
+
+      const allowed = await proxy.handle(
+        await signedRequest(adminSecret, method, path, body),
+      );
+      expect(allowed.status).toBe(200);
+    }
+    expect(upstream.calls).toHaveLength(routes.length);
+    expect(upstream.calls.every(
+      (call) => call.headers.get("authorization") === null,
+    )).toBe(true);
+  });
+
+  it("preserves existing registered-user daemon access", async () => {
+    const secretKey = registerNpub("user");
+    const routes = [
+      ["POST", "/v1/messages/count_tokens", JSON.stringify({ model: "routstr/test" })],
+      ["POST", "/stop", "{}"],
+      ["GET", "/providers?refresh=true", undefined],
+      ["POST", "/nwc/fund", "{}"],
+    ] as const;
+
+    for (const [method, path, body] of routes) {
+      const res = await proxy.handle(
+        await signedRequest(secretKey, method, path, body),
+      );
+      expect(res.status).toBe(200);
+    }
+    expect(upstream.calls).toHaveLength(routes.length);
+    expect(upstream.calls.every(
+      (call) => call.headers.get("authorization") === null,
+    )).toBe(true);
+  });
+
+  it("rejects the leading-double-slash authorization bypass", async () => {
+    const secretKey = registerNpub("user");
+    const res = await proxy.handle(
+      await signedRequest(secretKey, "GET", "//keys/api"),
+    );
+
+    expect(res.status).toBe(400);
+    expect(upstream.calls).toHaveLength(0);
+  });
+});
