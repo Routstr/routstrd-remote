@@ -1,6 +1,7 @@
 [0.1.34]
 * Security: a client API key can no longer read or delete provider credentials. `GET /keys/api` returned every upstream provider key in plaintext, and `POST`/`DELETE /keys/api/delete` refunded and removed them; both now require an admin npub over NIP-98, like the wallet sends. Any client key issued before this release could do both
 * Security: client API keys are now limited to the endpoints Routstr Core itself forwards -- the inference routes (`chat/completions`, `completions`, `responses`, `messages`, `messages/count_tokens`, `embeddings`, `systemone`, `decisions`) and the image routes. Everything else returns 403, notably `GET /balance`, `/keys/balance`, `/providers`, `/providers/reviews`, `/cooldowns`, `/status`, `/version`, `/settings/*`, `/wallet/*` and `/requests/*`. Inference and image calls are unchanged; use NIP-98 from a registered npub for the rest
+* Security: `GET /usagePi` is no longer reachable through the proxy and now answers 404. The daemon route returned every client's usage rows for a chosen second without the npub scoping `/usage` applies, so any registered npub could read other clients' ids and spend; the route is also removed from routstrd itself, so an image that still bundles the old daemon is covered either way
 * Security: request paths starting with `//` are rejected with 400. Bun collapsed the doubled slash when forwarding, so `//keys/api` reached the route the path check had just refused
 * Registered npubs keep their existing daemon access, and public routes are unchanged
 
