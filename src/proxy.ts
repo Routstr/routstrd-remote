@@ -1032,6 +1032,14 @@ export class AuthProxy {
     // The only route that marks proofs spent without a matching swap, which is
     // exactly how a proof gets destroyed rather than moved.
     "/wallet/cleanup",
+    // Despite the name this is not a read. With `dryRun` omitted -- the default
+    // -- it asks every mint about all ready and inflight proofs and writes
+    // `spent` for the ones the mint reports, which reclaims balance and, via
+    // `proofs:state-changed`, finalizes send operations that had reserved those
+    // inflight proofs. The CLI's "are you sure" prompt lives in the client, so
+    // the proxy cannot rely on it; unlike `/wallet/sweep-offline` the daemon has
+    // no `confirmed` guard here, so a bare `POST {}` applies immediately.
+    "/wallet/check-proofs",
 
     // ── Provider credentials ────────────────────────────────────────────────
     // `GET /keys/api` returns every upstream provider key in plaintext.
