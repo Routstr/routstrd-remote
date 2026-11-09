@@ -1181,17 +1181,82 @@ describe("daemon route capability boundary", () => {
     expect(upstream.calls).toHaveLength(routes.length);
   });
 
+  it("requires admin NIP-98 for wallet integrity and recovery routes", async () => {
+    const userSecret = registerNpub("user");
+    const adminSecret = registerNpub("admin");
+    const routes = [
+      ["POST", "/wallet/unlock", "{}"],
+      ["POST", "/wallet/mints", JSON.stringify({ url: "https://mint.invalid" })],
+      ["POST", "/wallet/mints/default", JSON.stringify({ url: "https://mint.invalid" })],
+      ["POST", "/wallet/cleanup", JSON.stringify({ dryRun: true })],
+      ["POST", "/wallet/recover", "{}"],
+      ["POST", "/wallet/recover/operations", "{}"],
+    ] as const;
+
+    for (const [method, path, body] of routes) {
+      const denied = await proxy.handle(
+        await signedRequest(userSecret, method, path, body),
+      );
+      expect(denied.status).toBe(403);
+
+      const allowed = await proxy.handle(
+        await signedRequest(adminSecret, method, path, body),
+      );
+      expect(allowed.status).toBe(200);
+    }
+    expect(upstream.calls).toHaveLength(routes.length);
+  });
+
+  it("leaves wallet reads and diagnostics open to any registered npub", async () => {
+    // The gate is on state change, not on the `/wallet` prefix: reads stay
+    // usable from the CLI for non-admins, and so do the stateless diagnostics.
+    const userSecret = registerNpub("user");
+    const routes = [
+      ["GET", "/wallet/mints", undefined],
+      ["GET", "/wallet/mints/default", undefined],
+      ["POST", "/wallet/mints/info", JSON.stringify({ url: "https://mint.invalid" })],
+      ["POST", "/wallet/check-proofs", JSON.stringify({ dryRun: true })],
+      ["GET", "/wallet/history", undefined],
+      ["GET", "/wallet/status", undefined],
+    ] as const;
+
+    for (const [method, path, body] of routes) {
+      const res = await proxy.handle(
+        await signedRequest(userSecret, method, path, body),
+      );
+      expect(res.status).toBe(200);
+    }
+    expect(upstream.calls).toHaveLength(routes.length);
+  });
+
   it("matches admin prefixes only on a full path segment", () => {
-    expect(AuthProxy.isAdminPath("/wallet/send/cashu/op1/mark-spent")).toBe(true);
-    expect(AuthProxy.isAdminPath("/wallet/send/cashu/")).toBe(true);
+    expect(AuthProxy.isAdminPath("POST", "/wallet/send/cashu/op1/mark-spent")).toBe(true);
+    expect(AuthProxy.isAdminPath("POST", "/wallet/send/cashu/")).toBe(true);
     // The trailing slash in the prefix is load-bearing: a lookalike route one
     // segment over must not inherit admin-only treatment.
-    expect(AuthProxy.isAdminPath("/wallet/send/cashuX")).toBe(false);
-    expect(AuthProxy.isAdminPath("/wallet/send")).toBe(false);
-    // Reads and non-value wallet routes stay open to any registered npub.
-    expect(AuthProxy.isAdminPath("/wallet/balance")).toBe(false);
-    expect(AuthProxy.isAdminPath("/wallet/cleanup")).toBe(false);
-    expect(AuthProxy.isAdminPath("/requests")).toBe(false);
+    expect(AuthProxy.isAdminPath("POST", "/wallet/send/cashuX")).toBe(false);
+    expect(AuthProxy.isAdminPath("POST", "/wallet/send")).toBe(false);
+    // Reads and non-mutating wallet routes stay open to any registered npub.
+    expect(AuthProxy.isAdminPath("POST", "/wallet/balance")).toBe(false);
+    expect(AuthProxy.isAdminPath("POST", "/wallet/check-proofs")).toBe(false);
+    expect(AuthProxy.isAdminPath("POST", "/requests")).toBe(false);
+    // State-changing wallet routes are admin-only, and matching is exact, so a
+    // read of the same resource (`GET /wallet/mints`) is a separate entry.
+    expect(AuthProxy.isAdminPath("POST", "/wallet/unlock")).toBe(true);
+    expect(AuthProxy.isAdminPath("POST", "/wallet/mints")).toBe(true);
+    expect(AuthProxy.isAdminPath("POST", "/wallet/mints/default")).toBe(true);
+    expect(AuthProxy.isAdminPath("POST", "/wallet/cleanup")).toBe(true);
+    expect(AuthProxy.isAdminPath("POST", "/wallet/recover")).toBe(true);
+    expect(AuthProxy.isAdminPath("POST", "/wallet/recover/operations")).toBe(true);
+    expect(AuthProxy.isAdminPath("POST", "/wallet/recoverX")).toBe(false);
+    // Method-aware entries: changing the mint set is admin work, reading it is
+    // not, and the daemon serves both on the same path.
+    expect(AuthProxy.isAdminPath("GET", "/wallet/mints")).toBe(false);
+    expect(AuthProxy.isAdminPath("GET", "/wallet/mints/default")).toBe(false);
+    expect(AuthProxy.isAdminPath("HEAD", "/wallet/mints")).toBe(false);
+    expect(AuthProxy.isAdminPath("PUT", "/wallet/mints")).toBe(false);
+    // Lowercase methods are normalized, matching isInferencePath.
+    expect(AuthProxy.isAdminPath("post", "/wallet/mints")).toBe(true);
   });
 
   it("preserves existing registered-user daemon access", async () => {

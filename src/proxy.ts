@@ -731,7 +731,7 @@ export class AuthProxy {
           ? undefined
           : new Uint8Array(await req.arrayBuffer());
 
-      const requiredRole = AuthProxy.isAdminPath(path) ? "admin" : "user";
+      const requiredRole = AuthProxy.isAdminPath(req.method, path) ? "admin" : "user";
       const auth = await this.authenticateNpub(
         req,
         authorization,
@@ -835,16 +835,51 @@ export class AuthProxy {
   /** Public path prefixes. */
   static PUBLIC_PREFIXES = ["/models/", "/v1/models/"];
 
-  /** Endpoints that require an admin NIP-98 identity. */
+  /** Endpoints that are admin-only for every method. */
   static ADMIN_PATHS = new Set([
+    // ── Moving value ────────────────────────────────────────────────────────
     "/wallet/send/cashu",
     "/wallet/send/bolt11",
     // Reclaims the proofs behind offline sends that were never claimed. The
     // daemon refuses it without `confirmed: true` precisely because unclaimed
     // tokens are invalidated, so it moves value like a send does.
     "/wallet/sweep-offline",
+    // Re-issues paid mint quotes nobody ever claimed. It recovers money, but it
+    // does so by minting against the wallet, so it is not a read.
+    "/wallet/recover",
+    "/wallet/recover/operations",
+
+    // ── Wallet integrity ────────────────────────────────────────────────────
+    // Gates the wallet's spending state. Without it nothing else in this list
+    // is reachable anyway, so gating it is what makes the rest mean anything.
+    "/wallet/unlock",
+    // The only route that marks proofs spent without a matching swap, which is
+    // exactly how a proof gets destroyed rather than moved.
+    "/wallet/cleanup",
+
+    // ── Provider credentials ────────────────────────────────────────────────
+    // `GET /keys/api` returns every upstream provider key in plaintext.
     "/keys/api",
     "/keys/api/delete",
+  ]);
+
+  /**
+   * Endpoints that are admin-only for some methods but readable by any
+   * registered npub for others.
+   *
+   * routstrd answers GET and POST on the same path for its wallet resources, so
+   * a path-only gate cannot express "changing this is admin work, reading it is
+   * not". The mint set is the case that matters: adding a mint or moving the
+   * default decides which mints the wallet trusts, but `routstrd wallet mints
+   * list` must keep working for a non-admin. `/wallet/mints/info` is a
+   * stateless lookup on a URL the caller supplies, so it stays off this list.
+   */
+  static ADMIN_METHODS: ReadonlyMap<string, ReadonlySet<string>> = new Map<
+    string,
+    ReadonlySet<string>
+  >([
+    ["/wallet/mints", new Set(["POST"])],
+    ["/wallet/mints/default", new Set(["POST"])],
   ]);
 
   /**
@@ -907,9 +942,10 @@ export class AuthProxy {
     return AuthProxy.PUBLIC_PREFIXES.some((prefix) => path.startsWith(prefix));
   }
 
-  static isAdminPath(path: string): boolean {
+  static isAdminPath(method: string, path: string): boolean {
     return (
       AuthProxy.ADMIN_PATHS.has(path) ||
+      (AuthProxy.ADMIN_METHODS.get(path)?.has(method.toUpperCase()) ?? false) ||
       AuthProxy.ADMIN_PREFIXES.some((prefix) => path.startsWith(prefix))
     );
   }
