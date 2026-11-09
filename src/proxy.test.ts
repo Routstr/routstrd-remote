@@ -1189,6 +1189,7 @@ describe("daemon route capability boundary", () => {
       ["POST", "/wallet/mints", JSON.stringify({ url: "https://mint.invalid" })],
       ["POST", "/wallet/mints/default", JSON.stringify({ url: "https://mint.invalid" })],
       ["POST", "/wallet/cleanup", JSON.stringify({ dryRun: true })],
+      ["POST", "/wallet/check-proofs", JSON.stringify({ dryRun: true })],
       ["POST", "/wallet/recover", "{}"],
       ["POST", "/wallet/recover/operations", "{}"],
     ] as const;
@@ -1215,7 +1216,6 @@ describe("daemon route capability boundary", () => {
       ["GET", "/wallet/mints", undefined],
       ["GET", "/wallet/mints/default", undefined],
       ["POST", "/wallet/mints/info", JSON.stringify({ url: "https://mint.invalid" })],
-      ["POST", "/wallet/check-proofs", JSON.stringify({ dryRun: true })],
       ["GET", "/wallet/history", undefined],
       ["GET", "/wallet/status", undefined],
     ] as const;
@@ -1238,7 +1238,7 @@ describe("daemon route capability boundary", () => {
     expect(AuthProxy.isAdminPath("POST", "/wallet/send")).toBe(false);
     // Reads and non-mutating wallet routes stay open to any registered npub.
     expect(AuthProxy.isAdminPath("POST", "/wallet/balance")).toBe(false);
-    expect(AuthProxy.isAdminPath("POST", "/wallet/check-proofs")).toBe(false);
+    // Not a read despite the name: it marks proofs spent by default.
     expect(AuthProxy.isAdminPath("POST", "/requests")).toBe(false);
     // State-changing wallet routes are admin-only, and matching is exact, so a
     // read of the same resource (`GET /wallet/mints`) is a separate entry.
@@ -1246,6 +1246,7 @@ describe("daemon route capability boundary", () => {
     expect(AuthProxy.isAdminPath("POST", "/wallet/mints")).toBe(true);
     expect(AuthProxy.isAdminPath("POST", "/wallet/mints/default")).toBe(true);
     expect(AuthProxy.isAdminPath("POST", "/wallet/cleanup")).toBe(true);
+    expect(AuthProxy.isAdminPath("POST", "/wallet/check-proofs")).toBe(true);
     expect(AuthProxy.isAdminPath("POST", "/wallet/recover")).toBe(true);
     expect(AuthProxy.isAdminPath("POST", "/wallet/recover/operations")).toBe(true);
     expect(AuthProxy.isAdminPath("POST", "/wallet/recoverX")).toBe(false);
