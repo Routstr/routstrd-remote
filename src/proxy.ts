@@ -1,6 +1,7 @@
 import { normalizeNostrPubkey, type AuthProxyConfig } from "./config";
 import { validateNIP98Request } from "./nip98";
 import { requestAuthorization } from "./auth";
+import { nextMonthStart, secondsUntilNextMonth } from "./quota";
 import { type Client, type NpubRole, AuthStore } from "./store";
 
 interface ParseNpubOptions {
@@ -23,6 +24,13 @@ const NPUB_NAME_REQUIRED_ERROR =
 const NPUB_NAME_CLEAR_ERROR =
   "Invalid name. A display name cannot be removed; provide a new name (1-64 characters).";
 
+/** Parsed body of the npub management endpoints (`POST`/`PATCH /npubs`). */
+interface NpubBody {
+  pubkey: string;
+  role?: NpubRole;
+  name?: string | null;
+  monthlyLimitSats?: number | null;
+}
 /**
  * Thin proxy that validates Bearer tokens or NIP-98 Nostr HTTP auth events and
  * forwards requests to the routstrd daemon running on localhost only.
@@ -45,6 +53,7 @@ export class AuthProxy {
     req: Request,
     body?: Uint8Array,
     stripAuth = true,
+    validatedApiKey?: string,
   ): Promise<Response> {
     const url = new URL(req.url);
     const upstreamUrl = `${this.config.upstream}${url.pathname}${url.search}`;
@@ -52,6 +61,12 @@ export class AuthProxy {
     const headers = new Headers(req.headers);
     if (stripAuth) {
       headers.delete("authorization");
+    }
+    if (validatedApiKey !== undefined) {
+      // Use the exact credential we authenticated, in the SDK's canonical form.
+      // Never let casing/whitespace or a conflicting x-api-key change attribution.
+      headers.set("authorization", `Bearer ${validatedApiKey}`);
+      if (headers.has("x-api-key")) headers.set("x-api-key", validatedApiKey);
     }
     headers.delete("host");
     headers.delete("content-length");
@@ -84,17 +99,21 @@ export class AuthProxy {
     }
   }
 
-  private json(data: unknown, status = 200): Response {
+  private json(
+    data: unknown,
+    status = 200,
+    headers: Record<string, string> = {},
+  ): Response {
     return new Response(JSON.stringify(data), {
       status,
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...headers },
     });
   }
 
   private parseNpubBody(
     raw: unknown,
     options: ParseNpubOptions = {},
-  ): { pubkey: string; role?: NpubRole; name?: string | null } | Response {
+  ): NpubBody | Response {
     if (raw === undefined || raw === null || (ArrayBuffer.isView(raw) && (raw as ArrayBufferView).byteLength === 0)) {
       return this.json({ error: "Request body is required. Provide { \"npub\": \"npub1...\" } or { \"pubkey\": \"<64-char hex>\" }." }, 400);
     }
@@ -122,7 +141,7 @@ export class AuthProxy {
   private extractNpub(
     parsed: unknown,
     options: ParseNpubOptions = {},
-  ): { pubkey: string; role?: NpubRole; name?: string | null } | Response {
+  ): NpubBody | Response {
     const value = typeof parsed === "string"
       ? parsed
       : parsed && typeof parsed === "object"
@@ -139,7 +158,7 @@ export class AuthProxy {
       return this.json({ error: "Invalid npub/pubkey. Use npub or 64-char hex pubkey." }, 400);
     }
 
-    const result: { pubkey: string; role?: NpubRole; name?: string | null } = { pubkey };
+    const result: NpubBody = { pubkey };
 
     if (parsed && typeof parsed === "object") {
       const roleRaw = (parsed as { role?: unknown }).role;
@@ -163,6 +182,24 @@ export class AuthProxy {
           result.name = trimmed === "" ? null : trimmed;
         } else {
           return this.json({ error: "Invalid name. Expected a string or null." }, 400);
+        }
+      }
+
+      const limitRaw = (parsed as { monthlyLimitSats?: unknown }).monthlyLimitSats;
+      if (limitRaw !== undefined) {
+        if (limitRaw === null) {
+          result.monthlyLimitSats = null;
+        } else if (
+          typeof limitRaw === "number" &&
+          Number.isSafeInteger(limitRaw) &&
+          limitRaw >= 0
+        ) {
+          result.monthlyLimitSats = limitRaw;
+        } else {
+          return this.json({
+            error:
+              "Invalid monthlyLimitSats. Expected a non-negative integer number of sats, or null to remove the limit.",
+          }, 400);
         }
       }
     }
@@ -280,6 +317,101 @@ export class AuthProxy {
     }
 
     return null;
+  }
+
+  /**
+   * The npub that owns a client. Prefers the explicit `ownerNpub` and falls
+   * back to the npub suffix the proxy appends to every client id.
+   */
+  private resolveClientNpub(client: Client): string | undefined {
+    const npubs = this.store.listNpubs();
+    if (client.ownerNpub) {
+      const owner = npubs.find((entry) => entry.npub === client.ownerNpub);
+      if (owner) return owner.pubkey;
+    }
+    for (const entry of npubs) {
+      if (client.clientId.endsWith(`-${this.getNpubSuffix(entry.npub)}`)) {
+        return entry.pubkey;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Enforce an npub's monthly sats cap.
+   *
+   * Returns a 402 response when the cap has already been reached, or null when
+   * the request may proceed. Spend is summed from the daemon's usage tracking
+   * table for the current calendar month. The request that crosses the cap is
+   * allowed -- its cost is only known after it completes -- and every following
+   * paid request is blocked until the month rolls over or an admin raises the
+   * limit.
+   */
+  /** Unavailable totals must never be displayed or enforced as zero spend. */
+  private readMonthlyUsage(): Map<string, number> | null {
+    try {
+      return this.store.getMonthlyUsageByNpub();
+    } catch (error) {
+      console.error("Monthly quota accounting unavailable:", error);
+      return null;
+    }
+  }
+
+  private checkMonthlyQuota(npub: string): Response | null {
+    const entry = this.store.getNpubByPubkey(npub);
+    if (!entry || entry.monthlyLimitSats === null) return null;
+
+    const limit = entry.monthlyLimitSats;
+    const usage = this.readMonthlyUsage();
+    if (usage === null) {
+      return this.json({
+        error: "Cannot verify monthly spend right now. Please retry later.",
+        code: "quota_accounting_unavailable",
+        error_type: "quota_accounting_unavailable",
+      }, 503);
+    }
+    const used = usage.get(entry.npub) ?? 0;
+    if (used < limit) return null;
+
+    const resetAt = Math.floor(nextMonthStart() / 1000);
+    const usedWhole = Math.floor(used);
+    return this.json(
+      {
+        error:
+          `Monthly spend limit reached: ${usedWhole} of ${limit} sats used for ${entry.npub}. ` +
+          "The limit resets on the first of next month; ask an admin to raise it.",
+        error_type: "monthly_quota_exceeded",
+        code: "monthly_quota_exceeded",
+        monthlyLimitSats: limit,
+        monthlyUsedSats: usedWhole,
+        monthlyResetAt: resetAt,
+      },
+      402,
+      {
+        "Retry-After": String(secondsUntilNextMonth()),
+        "X-Routstr-Quota-Limit-Sats": String(limit),
+        "X-Routstr-Quota-Used-Sats": String(usedWhole),
+        "X-Routstr-Quota-Reset": String(resetAt),
+      },
+    );
+  }
+
+  /** Apply the monthly cap only to requests that can spend money. */
+  private quotaResponse(npub: string, req: Request, nip98 = false): Response | null {
+    if (!AuthProxy.isPaidRequest(req.method, new URL(req.url).pathname)) {
+      return null;
+    }
+    if (nip98) {
+      const entry = this.store.getNpubByPubkey(npub);
+      if (entry && entry.monthlyLimitSats !== null) {
+        return this.json({
+          error: "Paid NIP-98 requests are not supported for capped npubs. Use an API-key client so spend can be accounted.",
+          code: "capped_npub_requires_api_key",
+          error_type: "capped_npub_requires_api_key",
+        }, 403);
+      }
+    }
+    return this.checkMonthlyQuota(npub);
   }
 
   private getNpubSuffix(npub: string): string {
@@ -513,8 +645,21 @@ export class AuthProxy {
       if (auth instanceof Response) return auth;
 
       const npubs = this.store.listNpubs();
+      const monthlyUsage = this.readMonthlyUsage();
+      // Spend is private: admins see everyone's, a member only their own.
+      const canSeeUsage = (entryPubkey: string) =>
+        auth.role === "admin" || entryPubkey === auth.pubkey;
       return this.json({
-        npubs: npubs.map((n) => ({ npub: n.npub, name: n.name, role: n.role })),
+        npubs: npubs.map((n) => ({
+          npub: n.npub,
+          name: n.name,
+          role: n.role,
+          monthlyLimitSats: n.monthlyLimitSats,
+          ...(monthlyUsage !== null && canSeeUsage(n.pubkey)
+            ? { monthlyUsedSats: Math.floor(monthlyUsage.get(n.npub) ?? 0) }
+            : {}),
+        })),
+        monthlyResetAt: Math.floor(nextMonthStart() / 1000),
       });
     }
 
@@ -541,10 +686,17 @@ export class AuthProxy {
       // bootstrap, default to user unless an admin explicitly sets role=admin.
       const role = parsed.role ?? (anyNpubs ? "user" : "admin");
       const name = parsed.name ?? null;
-      const entry = this.store.addNpub(parsed.pubkey, role, createdBy, name);
+      const monthlyLimitSats = parsed.monthlyLimitSats ?? null;
+      const entry = this.store.addNpub(
+        parsed.pubkey,
+        role,
+        createdBy,
+        name,
+        monthlyLimitSats,
+      );
       if (!entry.added) {
         return this.json({
-          error: "npub/pubkey already registered. Use PATCH /npubs to update role or name.",
+          error: "npub/pubkey already registered. Use PATCH /npubs to update its role, name or limit.",
           npub: entry.npub,
           pubkey: entry.pubkey,
         }, 409);
@@ -555,6 +707,7 @@ export class AuthProxy {
         pubkey: entry.pubkey,
         name: entry.name,
         role: entry.role,
+        monthlyLimitSats: entry.monthlyLimitSats,
         added: entry.added,
       }, 201);
     }
@@ -607,23 +760,37 @@ export class AuthProxy {
       const parsed = this.parseNpubBody(body, { forbidNameClear: true });
       if (parsed instanceof Response) return parsed;
 
-      if (!parsed.role && parsed.name === undefined) {
-        return this.json({ error: "Missing required field. Provide 'role' and/or 'name' to update." }, 400);
+      if (
+        !parsed.role &&
+        parsed.name === undefined &&
+        parsed.monthlyLimitSats === undefined
+      ) {
+        return this.json({
+          error:
+            "Missing required field. Provide 'role', 'name', and/or 'monthlyLimitSats' to update.",
+        }, 400);
       }
 
       const updated = this.store.updateNpub(parsed.pubkey, {
         role: parsed.role,
         name: parsed.name,
+        monthlyLimitSats: parsed.monthlyLimitSats,
       });
       if (!updated) {
         return this.json({ error: "npub/pubkey not found." }, 404);
       }
 
+      const monthlyUsage = this.readMonthlyUsage();
       return this.json({
         npub: updated.npub,
         pubkey: updated.pubkey,
         name: updated.name,
         role: updated.role,
+        monthlyLimitSats: updated.monthlyLimitSats,
+        ...(monthlyUsage !== null
+          ? { monthlyUsedSats: Math.floor(monthlyUsage.get(updated.npub) ?? 0) }
+          : {}),
+        monthlyResetAt: Math.floor(nextMonthStart() / 1000),
       });
     }
 
@@ -707,6 +874,12 @@ export class AuthProxy {
         return this.json({ error: "Invalid API key." }, 401);
       }
 
+      const clientNpub = this.resolveClientNpub(client);
+      if (clientNpub) {
+        const blocked = this.quotaResponse(clientNpub, req);
+        if (blocked) return blocked;
+      }
+
       // Buffer the body only when model allowlist enforcement is enabled,
       // so we can inspect the `model` field. When disabled, keep the
       // original streaming body to avoid the buffering latency.
@@ -718,8 +891,8 @@ export class AuthProxy {
       const blocked = this.checkModelAllowlist(body, req.method);
       if (blocked) return blocked;
 
-      // Keep auth header for Bearer tokens so upstream can validate.
-      return this.forward(req, body, false);
+      // Canonicalize all API-key carriers after validation for SDK attribution.
+      return this.forward(req, body, false, apiKey);
     }
 
     const nip98Match = authorization.match(/^Nostr\s+(.+)$/i);
@@ -739,6 +912,9 @@ export class AuthProxy {
         requiredRole,
       );
       if (auth instanceof Response) return auth;
+
+      const overQuota = this.quotaResponse(auth.pubkey, req, true);
+      if (overQuota) return overQuota;
 
       const blocked = this.checkModelAllowlist(body, req.method);
       if (blocked) return blocked;
@@ -820,7 +996,7 @@ export class AuthProxy {
     "Access-Control-Allow-Headers":
       "Authorization, X-Api-Key, Anthropic-Version, Anthropic-Beta, Content-Type, X-Cashu, X-Routstr-Model",
     "Access-Control-Expose-Headers":
-      "X-Cashu, X-Routstr-Request-Id, X-Routstr-Cost-Msats, X-Routstr-Cost-Usd, X-Routstr-Input-Cost-Msats, X-Routstr-Output-Cost-Msats",
+      "X-Cashu, X-Routstr-Request-Id, X-Routstr-Cost-Msats, X-Routstr-Cost-Usd, X-Routstr-Input-Cost-Msats, X-Routstr-Output-Cost-Msats, X-Routstr-Quota-Limit-Sats, X-Routstr-Quota-Used-Sats, X-Routstr-Quota-Reset, Retry-After",
     "Access-Control-Max-Age": "86400",
   };
 
@@ -968,6 +1144,33 @@ export class AuthProxy {
       AuthProxy.INFERENCE_ENDPOINTS.get(
         AuthProxy.canonicalApiPath(path),
       )?.has(method.toUpperCase()) ?? false
+    );
+  }
+
+  /**
+   * Routes that never spend from the wallet: proxy-managed npub/client/usage
+   * endpoints and the daemon's own wallet, NWC, settings, provider, key and
+   * control routes. Any other POST falls through to the paid inference proxy.
+   */
+  static NON_PAID_PREFIXES = [
+    "/npubs",
+    "/clients",
+    "/usage",
+    "/wallet",
+    "/nwc",
+    "/settings",
+    "/providers",
+    "/cooldowns",
+    "/keys",
+    "/stop",
+    "/refund",
+  ];
+
+  /** True for requests that can incur inference spend. */
+  static isPaidRequest(method: string, path: string): boolean {
+    if (method !== "POST") return false;
+    return !AuthProxy.NON_PAID_PREFIXES.some(
+      (prefix) => path === prefix || path.startsWith(`${prefix}/`),
     );
   }
 }
