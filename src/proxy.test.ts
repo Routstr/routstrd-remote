@@ -1157,6 +1157,43 @@ describe("daemon route capability boundary", () => {
     )).toBe(true);
   });
 
+  it("requires admin NIP-98 for the offline-send settlement routes", async () => {
+    // Both move value, and both are new in routstrd 0.5.0. `mark-spent` carries
+    // an operation id, so it is matched by prefix rather than by exact path.
+    const userSecret = registerNpub("user");
+    const adminSecret = registerNpub("admin");
+    const routes = [
+      ["POST", "/wallet/sweep-offline", JSON.stringify({ dryRun: true })],
+      ["POST", "/wallet/send/cashu/op1/mark-spent", "{}"],
+    ] as const;
+
+    for (const [method, path, body] of routes) {
+      const denied = await proxy.handle(
+        await signedRequest(userSecret, method, path, body),
+      );
+      expect(denied.status).toBe(403);
+
+      const allowed = await proxy.handle(
+        await signedRequest(adminSecret, method, path, body),
+      );
+      expect(allowed.status).toBe(200);
+    }
+    expect(upstream.calls).toHaveLength(routes.length);
+  });
+
+  it("matches admin prefixes only on a full path segment", () => {
+    expect(AuthProxy.isAdminPath("/wallet/send/cashu/op1/mark-spent")).toBe(true);
+    expect(AuthProxy.isAdminPath("/wallet/send/cashu/")).toBe(true);
+    // The trailing slash in the prefix is load-bearing: a lookalike route one
+    // segment over must not inherit admin-only treatment.
+    expect(AuthProxy.isAdminPath("/wallet/send/cashuX")).toBe(false);
+    expect(AuthProxy.isAdminPath("/wallet/send")).toBe(false);
+    // Reads and non-value wallet routes stay open to any registered npub.
+    expect(AuthProxy.isAdminPath("/wallet/balance")).toBe(false);
+    expect(AuthProxy.isAdminPath("/wallet/cleanup")).toBe(false);
+    expect(AuthProxy.isAdminPath("/requests")).toBe(false);
+  });
+
   it("preserves existing registered-user daemon access", async () => {
     const secretKey = registerNpub("user");
     const routes = [
