@@ -105,6 +105,18 @@ describe("AuthStore npub name field", () => {
     store.close();
   });
 
+  it("lists only the npubs that have no display name", () => {
+    const store = new AuthStore(tmpDbPath());
+    store.addNpub(API_NPUB, "user", ENV_ADMIN_A, "Alice");
+    store.addNpub("ab".repeat(32), "user", ENV_ADMIN_A);
+
+    expect(store.listNpubs()).toHaveLength(2);
+    expect(store.listUnnamedNpubs().map((entry) => entry.pubkey)).toEqual([
+      "ab".repeat(32),
+    ]);
+    store.close();
+  });
+
   it("updates a name and clears it with null", () => {
     const store = new AuthStore(tmpDbPath());
     store.addNpub(API_NPUB, "user", ENV_ADMIN_A, "Alice");

@@ -35,11 +35,13 @@ Starting the auth proxy does **not** automatically register the identity in `con
 
 ```bash
 # From inside the container (or its Cloudron terminal)
-routstrd npubs register
+routstrd npubs register --name "Alice"
 
 # Alternatively, from the Docker host
-docker exec -it <container> routstrd npubs register
+docker exec -it <container> routstrd npubs register --name "Alice"
 ```
+
+A display name is required — it is how the admin list tells identities apart. Omit `--name` on a terminal and the CLI prompts for it; in a script, pass it explicitly. The proxy rejects a registration that carries no name, so if `--name` is not recognised, update the CLI first (`npm i -g routstrd@latest`).
 
 No npub argument is needed: the CLI derives your npub from the `nsec` in its selected `config.json`. Inside the container this uses the container identity; on another machine it uses that machine's configured identity and auth URL.
 
@@ -61,7 +63,7 @@ bun i -g routstrd
 routstrd remote <cloudron-url>
 
 # Register yourself as the first admin (first npub gets admin by default)
-routstrd npubs register
+routstrd npubs register --name "Alice"
 ```
 
 That's it — you now have full access to routstrd on Cloudron. Integrate it with your coding agents:

@@ -280,7 +280,100 @@ describe("npub name endpoints", () => {
     expect(body.role).toBe("admin");
   });
 
-  it("PATCH /npubs clears a name with null", async () => {
+  it("POST /npubs requires a name on bootstrap and leaves the slot claimable", async () => {
+    const res = await proxy.handle(
+      new Request("http://localhost:8008/npubs", {
+        method: "POST",
+        body: JSON.stringify({ pubkey: "ef".repeat(32) }),
+      }),
+    );
+
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.field).toBe("name");
+    expect(body.error).toContain("name");
+
+    // A rejected attempt must not consume the unauthenticated bootstrap slot.
+    const store = new AuthStore(tmp.dbPath);
+    expect(store.countNpubs()).toBe(0);
+    store.close();
+
+    const retry = await proxy.handle(
+      new Request("http://localhost:8008/npubs", {
+        method: "POST",
+        body: JSON.stringify({ pubkey: "ef".repeat(32), name: "Alice" }),
+      }),
+    );
+    expect(retry.status).toBe(201);
+    expect((await retry.json()).role).toBe("admin");
+  });
+
+  it("POST /npubs requires a name when an admin adds an npub", async () => {
+    const secretKey = generateSecretKey();
+    const adminPubkey = getPublicKey(secretKey);
+    const targetPubkey = "ef".repeat(32);
+    const store = new AuthStore(tmp.dbPath);
+    store.addNpub(adminPubkey, "admin", null, "Admin");
+    store.close();
+
+    proxy.close();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    const payload = new TextEncoder().encode(
+      JSON.stringify({ pubkey: targetPubkey, role: "user" }),
+    );
+    const req = new Request("http://localhost:8008/npubs", {
+      method: "POST",
+      body: payload,
+    });
+    const auth = await nip98Authorization(secretKey, req, payload);
+    const res = await proxy.handle(
+      new Request(req.url, { method: "POST", headers: { Authorization: auth }, body: payload }),
+    );
+
+    expect(res.status).toBe(400);
+    const store2 = new AuthStore(tmp.dbPath);
+    expect(store2.getNpubByPubkey(targetPubkey)).toBeUndefined();
+    store2.close();
+  });
+
+  it("POST /npubs rejects a null name", async () => {
+    const res = await proxy.handle(
+      new Request("http://localhost:8008/npubs", {
+        method: "POST",
+        body: JSON.stringify({ pubkey: "ef".repeat(32), name: null }),
+      }),
+    );
+
+    expect(res.status).toBe(400);
+    expect((await res.json()).field).toBe("name");
+  });
+
+  it("POST /npubs rejects a whitespace-only name", async () => {
+    const res = await proxy.handle(
+      new Request("http://localhost:8008/npubs", {
+        method: "POST",
+        body: JSON.stringify({ pubkey: "ef".repeat(32), name: "   " }),
+      }),
+    );
+
+    expect(res.status).toBe(400);
+    expect((await res.json()).field).toBe("name");
+  });
+
+  it("POST /npubs rejects a bare npub string, which carries no name", async () => {
+    const res = await proxy.handle(
+      new Request("http://localhost:8008/npubs", {
+        method: "POST",
+        body: JSON.stringify("ef".repeat(32)),
+      }),
+    );
+
+    expect(res.status).toBe(400);
+    expect((await res.json()).field).toBe("name");
+  });
+
+  it("PATCH /npubs refuses to clear a name with null", async () => {
     const secretKey = generateSecretKey();
     const pubkey = getPublicKey(secretKey);
     const store = new AuthStore(tmp.dbPath);
@@ -302,9 +395,13 @@ describe("npub name endpoints", () => {
       new Request(req.url, { method: "PATCH", headers: { Authorization: auth }, body: payload }),
     );
 
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(400);
     const body = await res.json();
-    expect(body.name).toBeNull();
+    expect(body.field).toBe("name");
+
+    const store2 = new AuthStore(tmp.dbPath);
+    expect(store2.getNpubByPubkey(pubkey)?.name).toBe("Alice");
+    store2.close();
   });
 
   it("POST /npubs returns 409 for a duplicate npub", async () => {
@@ -422,7 +519,7 @@ describe("npub name endpoints", () => {
     expect(body.name).toBe("Bob");
   });
 
-  it("PATCH /npubs clears a name with a whitespace-only value", async () => {
+  it("PATCH /npubs refuses to clear a name with a whitespace-only value", async () => {
     const secretKey = generateSecretKey();
     const pubkey = getPublicKey(secretKey);
     const store = new AuthStore(tmp.dbPath);
@@ -444,8 +541,70 @@ describe("npub name endpoints", () => {
       new Request(req.url, { method: "PATCH", headers: { Authorization: auth }, body: payload }),
     );
 
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.field).toBe("name");
+
+    const store2 = new AuthStore(tmp.dbPath);
+    expect(store2.getNpubByPubkey(pubkey)?.name).toBe("Alice");
+    store2.close();
+  });
+
+  it("PATCH /npubs can name a legacy npub that has no name", async () => {
+    const secretKey = generateSecretKey();
+    const adminPubkey = getPublicKey(secretKey);
+    const legacyPubkey = "ab".repeat(32);
+    const store = new AuthStore(tmp.dbPath);
+    store.addNpub(adminPubkey, "admin", null, "Admin");
+    store.addNpub(legacyPubkey, "user", adminPubkey);
+    store.close();
+
+    proxy.close();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    const payload = new TextEncoder().encode(
+      JSON.stringify({ pubkey: legacyPubkey, name: "Legacy Person" }),
+    );
+    const req = new Request("http://localhost:8008/npubs", {
+      method: "PATCH",
+      body: payload,
+    });
+    const auth = await nip98Authorization(secretKey, req, payload);
+    const res = await proxy.handle(
+      new Request(req.url, { method: "PATCH", headers: { Authorization: auth }, body: payload }),
+    );
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).name).toBe("Legacy Person");
+  });
+
+  it("PATCH /npubs updates a role without requiring a name", async () => {
+    const secretKey = generateSecretKey();
+    const adminPubkey = getPublicKey(secretKey);
+    const legacyPubkey = "cd".repeat(32);
+    const store = new AuthStore(tmp.dbPath);
+    store.addNpub(adminPubkey, "admin", null, "Admin");
+    store.addNpub(legacyPubkey, "user", adminPubkey);
+    store.close();
+
+    proxy.close();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    const payload = new TextEncoder().encode(
+      JSON.stringify({ pubkey: legacyPubkey, role: "admin" }),
+    );
+    const req = new Request("http://localhost:8008/npubs", {
+      method: "PATCH",
+      body: payload,
+    });
+    const auth = await nip98Authorization(secretKey, req, payload);
+    const res = await proxy.handle(
+      new Request(req.url, { method: "PATCH", headers: { Authorization: auth }, body: payload }),
+    );
+
     expect(res.status).toBe(200);
     const body = await res.json();
+    expect(body.role).toBe("admin");
     expect(body.name).toBeNull();
   });
 });
