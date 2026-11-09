@@ -839,9 +839,25 @@ export class AuthProxy {
   static ADMIN_PATHS = new Set([
     "/wallet/send/cashu",
     "/wallet/send/bolt11",
+    // Reclaims the proofs behind offline sends that were never claimed. The
+    // daemon refuses it without `confirmed: true` precisely because unclaimed
+    // tokens are invalidated, so it moves value like a send does.
+    "/wallet/sweep-offline",
     "/keys/api",
     "/keys/api/delete",
   ]);
+
+  /**
+   * Admin-only path prefixes, for daemon routes that carry a parameter.
+   *
+   * `POST /wallet/send/cashu/<operationId>/mark-spent` settles an offline send
+   * (routstrd 0.5.0). It cannot live in `ADMIN_PATHS` because the operation id
+   * varies, and leaving it out would put settlement below sending: a plain
+   * registered npub cannot send cashu but could mark someone else's send spent.
+   *
+   * The trailing slash keeps `/wallet/send/cashuX` from matching.
+   */
+  static ADMIN_PREFIXES = ["/wallet/send/cashu/"];
 
   /**
    * Mirror of Routstr Core's `_ALLOWED_ENDPOINTS` (routstr/proxy.py), which is
@@ -892,7 +908,10 @@ export class AuthProxy {
   }
 
   static isAdminPath(path: string): boolean {
-    return AuthProxy.ADMIN_PATHS.has(path);
+    return (
+      AuthProxy.ADMIN_PATHS.has(path) ||
+      AuthProxy.ADMIN_PREFIXES.some((prefix) => path.startsWith(prefix))
+    );
   }
 
   /**
