@@ -1564,6 +1564,52 @@
             "creationDate": "Sat, 24 Oct 2026 04:20:19 GMT",
             "ts": "Sat, 24 Oct 2026 04:20:19 GMT",
             "publishState": "published"
+        },
+        "0.2.0": {
+            "manifest": {
+                "id": "io.routstr.routstrd-auth",
+                "title": "Routstrd Auth",
+                "author": "Routstr <hello@routstr.io>",
+                "description": "Auth proxy and daemon for the Routstr AI routing network",
+                "tagline": "Self-hosted Routstr node with bearer-token auth",
+                "version": "0.2.0",
+                "upstreamVersion": "0.2.0",
+                "healthCheckPath": "/health",
+                "httpPort": 8008,
+                "memoryLimit": 536870912,
+                "addons": {
+                    "localstorage": {
+                        "sqlite": {
+                            "paths": [
+                                "/app/data/routstrd/routstr.db"
+                            ]
+                        }
+                    }
+                },
+                "manifestVersion": 2,
+                "website": "https://routstr.com",
+                "contactEmail": "team@routstr.com",
+                "iconUrl": "https://routstr.com/favicon.ico",
+                "packagerName": "Routstr",
+                "packagerUrl": "https://github.com/Routstr",
+                "minBoxVersion": "10.1.1",
+                "changelog": "* Security: a client API key can no longer read or delete provider credentials. `GET /keys/api` returned every upstream provider key in plaintext, and `POST`/`DELETE /keys/api/delete` refunded and removed them; both now require an admin npub over NIP-98, like the wallet sends. Any client key issued before this release could do both\n* Security: client API keys are now limited to the endpoints Routstr Core itself forwards -- the inference routes (`chat/completions`, `completions`, `responses`, `messages`, `messages/count_tokens`, `embeddings`, `systemone`, `decisions`) and the image routes. Everything else returns 403, notably `GET /balance`, `/keys/balance`, `/providers`, `/providers/reviews`, `/cooldowns`, `/status`, `/version`, `/settings/*`, `/wallet/*` and `/requests/*`. Inference and image calls are unchanged; use NIP-98 from a registered npub for the rest\n* Security: state-changing and value-moving wallet routes now require an admin npub instead of any registered npub: `POST /wallet/send/cashu`, `/wallet/send/bolt11`, `/wallet/sweep-offline`, `/wallet/send/cashu/<id>/mark-spent`, `/wallet/recover`, `/wallet/recover/operations`, `/wallet/unlock`, `/wallet/cleanup` and `/wallet/check-proofs`, plus the mint setters `POST /wallet/mints` and `/wallet/mints/default`. Reads stay open to every registered npub, including `routstrd wallet mints list` and `/wallet/mints/info`. `check-proofs` is not a read despite the name: it marks mint-reported proofs spent, which reclaims balance and finalizes reserved sends\n* Security: `GET /usagePi` is no longer reachable through the proxy and now answers 404. The daemon route returned every client's usage rows for a chosen second without the npub scoping `/usage` applies, so any registered npub could read other clients' ids and spend; the route is also removed from routstrd itself, so an image that still bundles an old daemon is covered either way\n* Security: request paths starting with `//` are rejected with 400. Bun collapsed the doubled slash when forwarding, so `//keys/api` reached the route the path check had just refused\n* Per-npub monthly spend limits: an admin can set, clear and inspect a calendar-month sats cap for any npub, and spend is aggregated across the API keys that npub owns. A capped npub's paid requests are refused with 402 and `X-Routstr-Quota-*` headers until the month resets; management routes keep working. Paid NIP-98 requests are refused with 403 for a capped npub until usage can be attributed to them\n* Operate it from the CLI with `routstrd npubs add/update --limit-sats`, `--clear-limit`, and `routstrd npubs list`, which shows each npub's cap and current-month spend\n* Registering an npub now requires a display name. `POST /npubs` rejects a missing, null or whitespace-only name with 400, and `PATCH /npubs` refuses to clear one, so an identity can no longer be created nameless by any client. This covers the unauthenticated first-admin bootstrap too; a rejected attempt does not consume the bootstrap slot. Entries bootstrapped from `ROUTSTRD_AUTH_ADMIN_*` or migrated from the legacy admin table may still be unnamed, and startup logs a warning listing them\n* The image now runs `cloudron/base` 6.0.1 (Ubuntu 26.04) instead of 5.0.0, which drops the inherited CRITICAL vulnerabilities from 133 to 14 and the image size from 2.87 GB to 1.34 GB; the 14 that remain are all inherited from Cloudron's base and are recorded with statements and expiries in `.trivyignore.yaml`\n* Every release image is now scanned by Trivy before it is pushed, and the push is gated on the result. A CRITICAL that is neither fixed nor accepted with an expiry blocks the release\n* The app now requires Cloudron 10.1.1 or newer. The image moved from Ubuntu 24.04 to 26.04 in this release, which is the first time the platform underneath it has changed; Cloudron older than 10.1.1 has not been tested against it and is no longer offered this version. Boxes below the floor keep running their current version, and Cloudron reports the requirement when they try to update\n* Updated bundled routstrd to 0.5.0 and routstr-sdk to 0.5.1\n* routstrd 0.5.0 brings no-swap offline Cashu sends with manual settlement and a confirmed sweep for the ones that aged out, a periodic in-flight melt sweep with expired-quote rollback and rollback-aware melt history, recovery of paid NPC quotes and parked refund tokens, a cap on offline-send overpayment with an online fallback, and protection against a cancelled request starting wallet funding\n* It also adds persistent per-request lifecycle logs -- `routstrd logs` now shows one line per request with retries and failovers, with `--verbose`, `--follow`, filters and lifecycle trace routes -- an `auto-model-path` toggle applied without a restart, a compact route-first view of automatic model-path candidates, provider lists that hide unreachable nodes unless `--all` is passed, and a repair step for stale macOS code signatures on the standalone binary\n",
+                "postInstallMessage": "Routstrd Auth is now installed.\n\nThe app exposes an OpenAI-compatible Routstr endpoint protected by bearer-token auth. Persistent wallet/config/database data is stored under Cloudron's app data directory and included in backups.\n\nIf you need admin-only client management endpoints, set `routstrd remote <url>` and run `routstrd npubs register --name \"Your Name\"` to register the first admin npub. A display name is required, and the CLI prompts for one if you leave the flag out.\n",
+                "tags": [
+                    "ai",
+                    "proxy",
+                    "nostr",
+                    "bitcoin",
+                    "openai"
+                ],
+                "mediaLinks": [
+                    "https://www.routstr.com/"
+                ],
+                "dockerImage": "ghcr.io/sh1ftred/routstrd-pro:20261110-122643-1ac542add"
+            },
+            "creationDate": "Tue, 10 Nov 2026 12:30:24 GMT",
+            "ts": "Tue, 10 Nov 2026 12:30:24 GMT",
+            "publishState": "published"
         }
     }
 }
