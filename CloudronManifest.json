@@ -24,7 +24,7 @@
   "iconUrl": "https://routstr.com/favicon.ico",
   "packagerName": "Routstr",
   "packagerUrl": "https://github.com/Routstr",
-  "minBoxVersion": "9.1.0",
+  "minBoxVersion": "10.1.1",
   "changelog": "file://CHANGELOG",
   "postInstallMessage": "file://POSTINSTALL.md",
   "tags": [
