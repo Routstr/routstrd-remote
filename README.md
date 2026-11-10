@@ -35,11 +35,13 @@ Starting the auth proxy does **not** automatically register the identity in `con
 
 ```bash
 # From inside the container (or its Cloudron terminal)
-routstrd npubs register
+routstrd npubs register --name "Alice"
 
 # Alternatively, from the Docker host
-docker exec -it <container> routstrd npubs register
+docker exec -it <container> routstrd npubs register --name "Alice"
 ```
+
+A display name is required — it is how the admin list tells identities apart. Omit `--name` on a terminal and the CLI prompts for it; in a script, pass it explicitly. The proxy rejects a registration that carries no name, so if `--name` is not recognised, update the CLI first (`npm i -g routstrd@latest`).
 
 No npub argument is needed: the CLI derives your npub from the `nsec` in its selected `config.json`. Inside the container this uses the container identity; on another machine it uses that machine's configured identity and auth URL.
 
@@ -61,7 +63,7 @@ bun i -g routstrd
 routstrd remote <cloudron-url>
 
 # Register yourself as the first admin (first npub gets admin by default)
-routstrd npubs register
+routstrd npubs register --name "Alice"
 ```
 
 That's it — you now have full access to routstrd on Cloudron. Integrate it with your coding agents:
@@ -95,6 +97,69 @@ routstrd top
 # appended to client IDs for easy identification
 routstrd top
 ```
+
+### Monthly spend limits per npub
+
+Admins can cap how many sats each npub may spend per calendar month. The proxy
+checks the cap before forwarding a paid request and returns `402` once the npub
+has reached it, so every client that member owns is blocked together.
+
+```bash
+# Cap a new team member at 5,000 sats/month
+routstrd npubs add npub1... --limit-sats 5000
+
+# Change or remove the cap later
+routstrd npubs update npub1... --limit-sats 20000
+routstrd npubs update npub1... --clear-limit
+
+# See limits and current-month spend
+routstrd npubs list
+```
+
+The `--limit-sats`/`--clear-limit` flags require a `routstrd` CLI release that
+includes them (the proxy accepts the same fields over HTTP regardless).
+
+The same controls are available over HTTP when you do not want to use the CLI:
+
+```bash
+# Set (or clear with null) the cap
+curl -X PATCH "$AUTH_URL/npubs" -H "Authorization: Nostr <base64-event>" \
+  -H 'Content-Type: application/json' \
+  -d '{"npub":"npub1...","monthlyLimitSats":5000}'
+
+# POST /npubs also accepts "monthlyLimitSats" when adding a member
+curl "$AUTH_URL/npubs" -H "Authorization: Nostr <base64-event>" \
+  -H 'Content-Type: application/json' \
+  -d '{"npub":"npub1...","role":"user","monthlyLimitSats":5000}'
+```
+
+Semantics:
+
+- The month follows the proxy server's local timezone (UTC in the Cloudron
+  container unless `TZ` is set). Spend resets to zero at `00:00` on the first of
+  each month and no admin action is needed.
+- Spend is the daemon's `usage_tracking.sats_cost` for every client owned by the
+  npub, attributed by `ownerNpub` and falling back to the 7-character npub
+  suffix on client ids (so deleting and re-creating a client does not reset the
+  total).
+- The request that crosses the cap is allowed to finish — its cost is only known
+  after it completes. Every following paid request is blocked until the month
+  rolls over or an admin raises/clears the limit.
+- Only paid inference requests (`POST` to model endpoints) are blocked.
+  Wallet, client, usage, provider and npub management routes keep working, so an
+  npub that is over its limit can still list clients or ask an admin for help
+  (and an admin can always fix the limit).
+- If monthly usage cannot be read (including a missing usage table), capped
+  API-key inference returns `503` with `code: "quota_accounting_unavailable"`.
+  Unlimited inference and management routes remain available. Npub list/update
+  responses omit `monthlyUsedSats` when accounting is unavailable rather than
+  reporting zero. Errors are logged; enforcement resumes when reads recover.
+- `monthlyLimitSats: 0` blocks all paid requests. Omit it or set it to `null`
+  for unlimited.
+- Paid NIP-98 requests from capped npubs are rejected with `403` and
+  `code: "capped_npub_requires_api_key"`, regardless of current spend. Use an
+  API-key client so the daemon can account for spend. Unlimited npubs can still
+  use NIP-98 inference, and management routes remain available to capped npubs.
 
 ## Usage
 
@@ -213,12 +278,16 @@ The helper creates `Authorization: Nostr <base64-event>` headers whose signed ev
 
 ## Auth behaviour
 
-- **Public endpoints** (health, models, balance, etc.) — forwarded immediately, no token needed.
-- **Protected endpoints** — require a valid `Bearer` token that exists in the shared DB.
+- **Public endpoints** (`/health`, `/ping`, `/models`, `/v1/models`, and the `/models/*`, `/v1/models/*` prefixes) — forwarded immediately, no token needed. Balance routes are **not** public: they need a registered-npub NIP-98 identity.
+- **Forwarded endpoints** — client API keys (`Bearer` or `x-api-key`) are limited to the method/path pairs Routstr Core's own allowlist forwards (`_ALLOWED_ENDPOINTS` in core's `routstr/proxy.py`); anything else is a `403`. That covers the inference routes (`chat/completions`, `completions`, `responses`, `messages`, `messages/count_tokens`, `embeddings`, `systemone`, `decisions`) and the image routes. Daemon state and control routes — `GET /balance`, `/keys/balance`, `/providers`, `/cooldowns`, `/status`, `/version`, `/settings/*`, `/wallet/*`, `/requests/*` — are npub-only. Registered npubs retain signed daemon access, while these require an admin npub:
+  - anything that moves value: `POST /wallet/send/cashu`, `/wallet/send/bolt11`, `/wallet/sweep-offline`, `/wallet/send/cashu/<id>/mark-spent`, `/wallet/recover`, `/wallet/recover/operations`
+  - wallet integrity: `POST /wallet/unlock`, `/wallet/cleanup`, `/wallet/check-proofs`, and the mint setters `POST /wallet/mints` and `/wallet/mints/default` (the `GET` reads and `/wallet/mints/info` stay open to any registered npub). `check-proofs` is not a read despite the name: it marks mint-reported proofs spent, which reclaims balance and finalizes reserved sends
+  - provider API-key listing and deletion
 - **Registered npubs** — stored in the shared `routstr.db` table `routstr_auth_npubs`. Env-configured admins are bootstrapped into that table at startup.
-- **List npubs** — `GET /npubs` returns `{ "npubs": [...] }` with each npub's `npub`, `name`, and `role`. Requires NIP-98 auth from a registered npub.
-- **Add npubs** — `POST /npubs` with `{ "npub": "npub1..." }` or `{ "pubkey": "<64-char hex>" }`, optionally `{ "role": "user", "name": "Alice" }`. If no npubs are configured yet, this first add is unauthenticated; after that it requires NIP-98 auth from an existing admin. Duplicate npubs return `409`; use `PATCH /npubs` to update an existing entry.
-- **Update npubs** — `PATCH /npubs` with `{ "npub": "npub1..." }` or `{ "pubkey": "<64-char hex>" }` plus `role` and/or `name`. Requires NIP-98 auth from an existing admin. Set `name` to `null` to clear it.
+- **List npubs** — `GET /npubs` returns `{ "npubs": [...] }` with each npub's `npub`, `name`, `role`, `monthlyLimitSats` (`null` = unlimited), plus a top-level `monthlyResetAt` (Unix seconds). Admins also get every npub's `monthlyUsedSats`; a member only gets their own. Requires NIP-98 auth from a registered npub.
+- **Add npubs** — `POST /npubs` with `{ "npub": "npub1..." }` or `{ "pubkey": "<64-char hex>" }`, optionally `{ "role": "user", "name": "Alice", "monthlyLimitSats": 5000 }`. If no npubs are configured yet, this first add is unauthenticated; after that it requires NIP-98 auth from an existing admin. Duplicate npubs return `409`; use `PATCH /npubs` to update an existing entry.
+- **Update npubs** — `PATCH /npubs` with `{ "npub": "npub1..." }` or `{ "pubkey": "<64-char hex>" }` plus `role`, `name` and/or `monthlyLimitSats`. Requires NIP-98 auth from an existing admin. Set `name` to `null` to clear it and `monthlyLimitSats` to `null` to remove the monthly cap.
+- **Monthly spend cap** — paid requests are checked against the npub's cap and return `402` with `code: "monthly_quota_exceeded"` and `X-Routstr-Quota-*` headers once it is reached. See [Monthly spend limits per npub](#monthly-spend-limits-per-npub).
 - **Remove npubs** — `DELETE /npubs/<npub-or-pubkey>` (or `DELETE /npubs?npub=...`) requires NIP-98 auth from an existing admin.
 - **Forwarded headers** — the proxy strips `Authorization` and injects `x-routstr-client-id` so the daemon knows which client made the request.
 

@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM docker.io/cloudron/base:5.0.0@sha256:04fd70dbd8ad6149c19de39e35718e024417c3e01dc9c6637eaf4a41ec4e596c
+FROM docker.io/cloudron/base:6.0.1@sha256:7b1e729960c3ca312d26e886917ba89483241bba0219ff292858e10d9d5768ee
 
 USER root
 
@@ -35,7 +35,7 @@ RUN apt-get update \
 # Pin the version: unpinned, this layer resolves npm `latest` at build time, so
 # builds are not reproducible and a cached layer can silently ship a stale
 # daemon (observed shipping 0.4.12 while 0.4.14 was `latest`).
-RUN bun install --global routstrd@0.4.18 \
+RUN bun install --global routstrd@0.5.0 \
     && ln -sf /usr/local/bun/bin/routstrd /usr/local/bin/routstrd \
     && test -f /usr/local/bun/install/global/node_modules/routstrd/dist/daemon/index.js
 

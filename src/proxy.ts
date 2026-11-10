@@ -1,8 +1,36 @@
 import { normalizeNostrPubkey, type AuthProxyConfig } from "./config";
 import { validateNIP98Request } from "./nip98";
 import { requestAuthorization } from "./auth";
+import { nextMonthStart, secondsUntilNextMonth } from "./quota";
 import { type Client, type NpubRole, AuthStore } from "./store";
 
+interface ParseNpubOptions {
+  /** Reject a body that does not carry a usable display name (npub creation). */
+  requireName?: boolean;
+  /** Reject an explicit attempt to clear the name (npub updates). */
+  forbidNameClear?: boolean;
+}
+
+/**
+ * Display names are mandatory when an npub is registered, so the admin list
+ * always says who an identity belongs to. The message names the CLI flag and
+ * the upgrade path, because an older `routstrd` cannot send `--name` at all.
+ */
+const NPUB_NAME_REQUIRED_ERROR =
+  "Missing required field 'name'. Provide a display name (1-64 characters), " +
+  "e.g. routstrd npubs add <npub> --name \"Alice\". If your routstrd does not " +
+  "support --name, update it first ('npm i -g routstrd@latest').";
+
+const NPUB_NAME_CLEAR_ERROR =
+  "Invalid name. A display name cannot be removed; provide a new name (1-64 characters).";
+
+/** Parsed body of the npub management endpoints (`POST`/`PATCH /npubs`). */
+interface NpubBody {
+  pubkey: string;
+  role?: NpubRole;
+  name?: string | null;
+  monthlyLimitSats?: number | null;
+}
 /**
  * Thin proxy that validates Bearer tokens or NIP-98 Nostr HTTP auth events and
  * forwards requests to the routstrd daemon running on localhost only.
@@ -25,6 +53,7 @@ export class AuthProxy {
     req: Request,
     body?: Uint8Array,
     stripAuth = true,
+    validatedApiKey?: string,
   ): Promise<Response> {
     const url = new URL(req.url);
     const upstreamUrl = `${this.config.upstream}${url.pathname}${url.search}`;
@@ -32,6 +61,12 @@ export class AuthProxy {
     const headers = new Headers(req.headers);
     if (stripAuth) {
       headers.delete("authorization");
+    }
+    if (validatedApiKey !== undefined) {
+      // Use the exact credential we authenticated, in the SDK's canonical form.
+      // Never let casing/whitespace or a conflicting x-api-key change attribution.
+      headers.set("authorization", `Bearer ${validatedApiKey}`);
+      if (headers.has("x-api-key")) headers.set("x-api-key", validatedApiKey);
     }
     headers.delete("host");
     headers.delete("content-length");
@@ -64,16 +99,21 @@ export class AuthProxy {
     }
   }
 
-  private json(data: unknown, status = 200): Response {
+  private json(
+    data: unknown,
+    status = 200,
+    headers: Record<string, string> = {},
+  ): Response {
     return new Response(JSON.stringify(data), {
       status,
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...headers },
     });
   }
 
   private parseNpubBody(
     raw: unknown,
-  ): { pubkey: string; role?: NpubRole; name?: string | null } | Response {
+    options: ParseNpubOptions = {},
+  ): NpubBody | Response {
     if (raw === undefined || raw === null || (ArrayBuffer.isView(raw) && (raw as ArrayBufferView).byteLength === 0)) {
       return this.json({ error: "Request body is required. Provide { \"npub\": \"npub1...\" } or { \"pubkey\": \"<64-char hex>\" }." }, 400);
     }
@@ -91,14 +131,17 @@ export class AuthProxy {
       } catch {
         return this.json({ error: "Invalid JSON body." }, 400);
       }
-      return this.extractNpub(parsed);
+      return this.extractNpub(parsed, options);
     }
 
     // Accept already-parsed JSON object
-    return this.extractNpub(raw);
+    return this.extractNpub(raw, options);
   }
 
-  private extractNpub(parsed: unknown): { pubkey: string; role?: NpubRole; name?: string | null } | Response {
+  private extractNpub(
+    parsed: unknown,
+    options: ParseNpubOptions = {},
+  ): NpubBody | Response {
     const value = typeof parsed === "string"
       ? parsed
       : parsed && typeof parsed === "object"
@@ -115,7 +158,7 @@ export class AuthProxy {
       return this.json({ error: "Invalid npub/pubkey. Use npub or 64-char hex pubkey." }, 400);
     }
 
-    const result: { pubkey: string; role?: NpubRole; name?: string | null } = { pubkey };
+    const result: NpubBody = { pubkey };
 
     if (parsed && typeof parsed === "object") {
       const roleRaw = (parsed as { role?: unknown }).role;
@@ -141,6 +184,33 @@ export class AuthProxy {
           return this.json({ error: "Invalid name. Expected a string or null." }, 400);
         }
       }
+
+      const limitRaw = (parsed as { monthlyLimitSats?: unknown }).monthlyLimitSats;
+      if (limitRaw !== undefined) {
+        if (limitRaw === null) {
+          result.monthlyLimitSats = null;
+        } else if (
+          typeof limitRaw === "number" &&
+          Number.isSafeInteger(limitRaw) &&
+          limitRaw >= 0
+        ) {
+          result.monthlyLimitSats = limitRaw;
+        } else {
+          return this.json({
+            error:
+              "Invalid monthlyLimitSats. Expected a non-negative integer number of sats, or null to remove the limit.",
+          }, 400);
+        }
+      }
+    }
+
+    // Creating an npub requires a name so every entry in the admin list is
+    // attributable to a person. Clearing one is refused for the same reason.
+    if (options.requireName && (result.name === undefined || result.name === null)) {
+      return this.json({ error: NPUB_NAME_REQUIRED_ERROR, field: "name" }, 400);
+    }
+    if (options.forbidNameClear && result.name === null) {
+      return this.json({ error: NPUB_NAME_CLEAR_ERROR, field: "name" }, 400);
     }
 
     return result;
@@ -247,6 +317,101 @@ export class AuthProxy {
     }
 
     return null;
+  }
+
+  /**
+   * The npub that owns a client. Prefers the explicit `ownerNpub` and falls
+   * back to the npub suffix the proxy appends to every client id.
+   */
+  private resolveClientNpub(client: Client): string | undefined {
+    const npubs = this.store.listNpubs();
+    if (client.ownerNpub) {
+      const owner = npubs.find((entry) => entry.npub === client.ownerNpub);
+      if (owner) return owner.pubkey;
+    }
+    for (const entry of npubs) {
+      if (client.clientId.endsWith(`-${this.getNpubSuffix(entry.npub)}`)) {
+        return entry.pubkey;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Enforce an npub's monthly sats cap.
+   *
+   * Returns a 402 response when the cap has already been reached, or null when
+   * the request may proceed. Spend is summed from the daemon's usage tracking
+   * table for the current calendar month. The request that crosses the cap is
+   * allowed -- its cost is only known after it completes -- and every following
+   * paid request is blocked until the month rolls over or an admin raises the
+   * limit.
+   */
+  /** Unavailable totals must never be displayed or enforced as zero spend. */
+  private readMonthlyUsage(): Map<string, number> | null {
+    try {
+      return this.store.getMonthlyUsageByNpub();
+    } catch (error) {
+      console.error("Monthly quota accounting unavailable:", error);
+      return null;
+    }
+  }
+
+  private checkMonthlyQuota(npub: string): Response | null {
+    const entry = this.store.getNpubByPubkey(npub);
+    if (!entry || entry.monthlyLimitSats === null) return null;
+
+    const limit = entry.monthlyLimitSats;
+    const usage = this.readMonthlyUsage();
+    if (usage === null) {
+      return this.json({
+        error: "Cannot verify monthly spend right now. Please retry later.",
+        code: "quota_accounting_unavailable",
+        error_type: "quota_accounting_unavailable",
+      }, 503);
+    }
+    const used = usage.get(entry.npub) ?? 0;
+    if (used < limit) return null;
+
+    const resetAt = Math.floor(nextMonthStart() / 1000);
+    const usedWhole = Math.floor(used);
+    return this.json(
+      {
+        error:
+          `Monthly spend limit reached: ${usedWhole} of ${limit} sats used for ${entry.npub}. ` +
+          "The limit resets on the first of next month; ask an admin to raise it.",
+        error_type: "monthly_quota_exceeded",
+        code: "monthly_quota_exceeded",
+        monthlyLimitSats: limit,
+        monthlyUsedSats: usedWhole,
+        monthlyResetAt: resetAt,
+      },
+      402,
+      {
+        "Retry-After": String(secondsUntilNextMonth()),
+        "X-Routstr-Quota-Limit-Sats": String(limit),
+        "X-Routstr-Quota-Used-Sats": String(usedWhole),
+        "X-Routstr-Quota-Reset": String(resetAt),
+      },
+    );
+  }
+
+  /** Apply the monthly cap only to requests that can spend money. */
+  private quotaResponse(npub: string, req: Request, nip98 = false): Response | null {
+    if (!AuthProxy.isPaidRequest(req.method, new URL(req.url).pathname)) {
+      return null;
+    }
+    if (nip98) {
+      const entry = this.store.getNpubByPubkey(npub);
+      if (entry && entry.monthlyLimitSats !== null) {
+        return this.json({
+          error: "Paid NIP-98 requests are not supported for capped npubs. Use an API-key client so spend can be accounted.",
+          code: "capped_npub_requires_api_key",
+          error_type: "capped_npub_requires_api_key",
+        }, 403);
+      }
+    }
+    return this.checkMonthlyQuota(npub);
   }
 
   private getNpubSuffix(npub: string): string {
@@ -480,8 +645,21 @@ export class AuthProxy {
       if (auth instanceof Response) return auth;
 
       const npubs = this.store.listNpubs();
+      const monthlyUsage = this.readMonthlyUsage();
+      // Spend is private: admins see everyone's, a member only their own.
+      const canSeeUsage = (entryPubkey: string) =>
+        auth.role === "admin" || entryPubkey === auth.pubkey;
       return this.json({
-        npubs: npubs.map((n) => ({ npub: n.npub, name: n.name, role: n.role })),
+        npubs: npubs.map((n) => ({
+          npub: n.npub,
+          name: n.name,
+          role: n.role,
+          monthlyLimitSats: n.monthlyLimitSats,
+          ...(monthlyUsage !== null && canSeeUsage(n.pubkey)
+            ? { monthlyUsedSats: Math.floor(monthlyUsage.get(n.npub) ?? 0) }
+            : {}),
+        })),
+        monthlyResetAt: Math.floor(nextMonthStart() / 1000),
       });
     }
 
@@ -501,17 +679,24 @@ export class AuthProxy {
         createdBy = auth.pubkey;
       }
 
-      const parsed = this.parseNpubBody(body);
+      const parsed = this.parseNpubBody(body, { requireName: true });
       if (parsed instanceof Response) return parsed;
 
       // Bootstrap the very first registered npub as admin by default. After
       // bootstrap, default to user unless an admin explicitly sets role=admin.
       const role = parsed.role ?? (anyNpubs ? "user" : "admin");
       const name = parsed.name ?? null;
-      const entry = this.store.addNpub(parsed.pubkey, role, createdBy, name);
+      const monthlyLimitSats = parsed.monthlyLimitSats ?? null;
+      const entry = this.store.addNpub(
+        parsed.pubkey,
+        role,
+        createdBy,
+        name,
+        monthlyLimitSats,
+      );
       if (!entry.added) {
         return this.json({
-          error: "npub/pubkey already registered. Use PATCH /npubs to update role or name.",
+          error: "npub/pubkey already registered. Use PATCH /npubs to update its role, name or limit.",
           npub: entry.npub,
           pubkey: entry.pubkey,
         }, 409);
@@ -522,6 +707,7 @@ export class AuthProxy {
         pubkey: entry.pubkey,
         name: entry.name,
         role: entry.role,
+        monthlyLimitSats: entry.monthlyLimitSats,
         added: entry.added,
       }, 201);
     }
@@ -571,26 +757,40 @@ export class AuthProxy {
       );
       if (auth instanceof Response) return auth;
 
-      const parsed = this.parseNpubBody(body);
+      const parsed = this.parseNpubBody(body, { forbidNameClear: true });
       if (parsed instanceof Response) return parsed;
 
-      if (!parsed.role && parsed.name === undefined) {
-        return this.json({ error: "Missing required field. Provide 'role' and/or 'name' to update." }, 400);
+      if (
+        !parsed.role &&
+        parsed.name === undefined &&
+        parsed.monthlyLimitSats === undefined
+      ) {
+        return this.json({
+          error:
+            "Missing required field. Provide 'role', 'name', and/or 'monthlyLimitSats' to update.",
+        }, 400);
       }
 
       const updated = this.store.updateNpub(parsed.pubkey, {
         role: parsed.role,
         name: parsed.name,
+        monthlyLimitSats: parsed.monthlyLimitSats,
       });
       if (!updated) {
         return this.json({ error: "npub/pubkey not found." }, 404);
       }
 
+      const monthlyUsage = this.readMonthlyUsage();
       return this.json({
         npub: updated.npub,
         pubkey: updated.pubkey,
         name: updated.name,
         role: updated.role,
+        monthlyLimitSats: updated.monthlyLimitSats,
+        ...(monthlyUsage !== null
+          ? { monthlyUsedSats: Math.floor(monthlyUsage.get(updated.npub) ?? 0) }
+          : {}),
+        monthlyResetAt: Math.floor(nextMonthStart() / 1000),
       });
     }
 
@@ -613,6 +813,12 @@ export class AuthProxy {
     const path = url.pathname;
     const authorization = requestAuthorization(req);
 
+    // Bun preserves leading `//` inbound but collapses it on outbound fetch,
+    // which would make exact path authorization and the daemon disagree.
+    if (path.startsWith("//")) {
+      return this.json({ error: "Invalid request path." }, 400);
+    }
+
     if (path === "/npubs" || path.startsWith("/npubs/")) {
       return this.handleNpubs(req, path);
     }
@@ -623,6 +829,16 @@ export class AuthProxy {
 
     if (path === "/usage" || path === "/usage/summary") {
       return this.handleUsage(req);
+    }
+
+    // `/usage` and `/usage/summary` are served above with the caller's npub
+    // injected so the daemon scopes rows to that identity. Every other
+    // `/usage*` path -- notably the daemon's unscoped `/usagePi`, which returns
+    // all clients' rows for a given second -- is refused here rather than
+    // forwarded, so it cannot step around that scoping. routstrd removes the
+    // route itself; this guard also covers daemons that still ship it.
+    if (path.startsWith("/usage")) {
+      return this.json({ error: "Not found." }, 404);
     }
 
     // Reads only: the daemon routes a POST to these paths as a paid request.
@@ -646,10 +862,9 @@ export class AuthProxy {
 
     const bearerMatch = authorization.match(/^Bearer\s+(.+)$/i);
     if (bearerMatch) {
-      // API key: block /clients/add and wallet endpoints
-      if (AuthProxy.isRestrictedPath(path)) {
+      if (!AuthProxy.isInferencePath(req.method, path)) {
         return this.json({
-          error: "API keys cannot access this endpoint. Use NIP-98 auth from a registered npub/pubkey.",
+          error: "API keys can access inference endpoints only. Use NIP-98 auth with the required role.",
         }, 403);
       }
 
@@ -659,22 +874,25 @@ export class AuthProxy {
         return this.json({ error: "Invalid API key." }, 401);
       }
 
+      const clientNpub = this.resolveClientNpub(client);
+      if (clientNpub) {
+        const blocked = this.quotaResponse(clientNpub, req);
+        if (blocked) return blocked;
+      }
+
       // Buffer the body only when model allowlist enforcement is enabled,
       // so we can inspect the `model` field. When disabled, keep the
       // original streaming body to avoid the buffering latency.
       let body: Uint8Array | undefined;
-      if (
-        this.config.modelAllowlistEnabled &&
-        (req.method === "POST" || req.method === "PUT" || req.method === "PATCH")
-      ) {
+      if (this.config.modelAllowlistEnabled) {
         body = new Uint8Array(await req.arrayBuffer());
       }
 
       const blocked = this.checkModelAllowlist(body, req.method);
       if (blocked) return blocked;
 
-      // Keep auth header for Bearer tokens so upstream can validate.
-      return this.forward(req, body, false);
+      // Canonicalize all API-key carriers after validation for SDK attribution.
+      return this.forward(req, body, false, apiKey);
     }
 
     const nip98Match = authorization.match(/^Nostr\s+(.+)$/i);
@@ -686,30 +904,17 @@ export class AuthProxy {
           ? undefined
           : new Uint8Array(await req.arrayBuffer());
 
-      // Determine required role first to generate the right error message
-      if (AuthProxy.isAdminPath(path)) {
-        const auth = await this.authenticateNpub(req, authorization, body, "admin");
-        if (auth instanceof Response) return auth;
-
-        const blocked = this.checkModelAllowlist(body, req.method);
-        if (blocked) return blocked;
-
-        return this.forward(req, body);
-      }
-
-      if (AuthProxy.isNpubRestrictedPath(path)) {
-        const auth = await this.authenticateNpub(req, authorization, body, "user");
-        if (auth instanceof Response) return auth;
-
-        const blocked = this.checkModelAllowlist(body, req.method);
-        if (blocked) return blocked;
-
-        return this.forward(req, body);
-      }
-
-      // Default: any registered npub can access
-      const auth = await this.authenticateNpub(req, authorization, body, "user");
+      const requiredRole = AuthProxy.isAdminPath(req.method, path) ? "admin" : "user";
+      const auth = await this.authenticateNpub(
+        req,
+        authorization,
+        body,
+        requiredRole,
+      );
       if (auth instanceof Response) return auth;
+
+      const overQuota = this.quotaResponse(auth.pubkey, req, true);
+      if (overQuota) return overQuota;
 
       const blocked = this.checkModelAllowlist(body, req.method);
       if (blocked) return blocked;
@@ -736,6 +941,17 @@ export class AuthProxy {
       console.warn(
         "  Warning: no registered npub/pubkey. " +
           "The first admin can be registered without auth using POST /npubs.",
+      );
+    }
+
+    const unnamed = this.store.listUnnamedNpubs();
+    if (unnamed.length > 0) {
+      const shown = unnamed.slice(0, 5).map((entry) => entry.npub.slice(-9)).join(", ");
+      const more = unnamed.length > 5 ? ` (+${unnamed.length - 5} more)` : "";
+      console.warn(
+        `  Warning: ${unnamed.length} npub(s) have no display name: ${shown}${more}. ` +
+          "They were bootstrapped from ROUTSTRD_AUTH_ADMIN_* or migrated from the " +
+          "legacy admin table. Set one with: routstrd npubs update <npub> --name \"Alice\"",
       );
     }
 
@@ -780,7 +996,7 @@ export class AuthProxy {
     "Access-Control-Allow-Headers":
       "Authorization, X-Api-Key, Anthropic-Version, Anthropic-Beta, Content-Type, X-Cashu, X-Routstr-Model",
     "Access-Control-Expose-Headers":
-      "X-Cashu, X-Routstr-Request-Id, X-Routstr-Cost-Msats, X-Routstr-Cost-Usd, X-Routstr-Input-Cost-Msats, X-Routstr-Output-Cost-Msats",
+      "X-Cashu, X-Routstr-Request-Id, X-Routstr-Cost-Msats, X-Routstr-Cost-Usd, X-Routstr-Input-Cost-Msats, X-Routstr-Output-Cost-Msats, X-Routstr-Quota-Limit-Sats, X-Routstr-Quota-Used-Sats, X-Routstr-Quota-Reset, Retry-After",
     "Access-Control-Max-Age": "86400",
   };
 
@@ -795,29 +1011,114 @@ export class AuthProxy {
   /** Public path prefixes. */
   static PUBLIC_PREFIXES = ["/models/", "/v1/models/"];
 
-  /** Endpoints that require an admin NIP-98 identity. */
+  /** Endpoints that are admin-only for every method. */
   static ADMIN_PATHS = new Set([
+    // ── Moving value ────────────────────────────────────────────────────────
     "/wallet/send/cashu",
     "/wallet/send/bolt11",
+    // Reclaims the proofs behind offline sends that were never claimed. The
+    // daemon refuses it without `confirmed: true` precisely because unclaimed
+    // tokens are invalidated, so it moves value like a send does.
+    "/wallet/sweep-offline",
+    // Re-issues paid mint quotes nobody ever claimed. It recovers money, but it
+    // does so by minting against the wallet, so it is not a read.
+    "/wallet/recover",
+    "/wallet/recover/operations",
+
+    // ── Wallet integrity ────────────────────────────────────────────────────
+    // Gates the wallet's spending state. Without it nothing else in this list
+    // is reachable anyway, so gating it is what makes the rest mean anything.
+    "/wallet/unlock",
+    // The only route that marks proofs spent without a matching swap, which is
+    // exactly how a proof gets destroyed rather than moved.
+    "/wallet/cleanup",
+    // Despite the name this is not a read. With `dryRun` omitted -- the default
+    // -- it asks every mint about all ready and inflight proofs and writes
+    // `spent` for the ones the mint reports, which reclaims balance and, via
+    // `proofs:state-changed`, finalizes send operations that had reserved those
+    // inflight proofs. The CLI's "are you sure" prompt lives in the client, so
+    // the proxy cannot rely on it; unlike `/wallet/sweep-offline` the daemon has
+    // no `confirmed` guard here, so a bare `POST {}` applies immediately.
+    "/wallet/check-proofs",
+
+    // ── Provider credentials ────────────────────────────────────────────────
+    // `GET /keys/api` returns every upstream provider key in plaintext.
+    "/keys/api",
+    "/keys/api/delete",
   ]);
 
-  /** Endpoints restricted to registered npubs (admin + user). API keys cannot access. */
-  static NPUB_RESTRICTED_PATHS = new Set([
-    "/wallet/status",
-    "/wallet/unlock",
-    "/wallet/balance",
-    "/wallet/receive/cashu",
-    "/wallet/receive/bolt11",
-    "/wallet/mints",
-    "/wallet/mints/info",
-    // Daemon control: an API key buys inference, nothing more. /providers is
-    // here because ?refresh=true rewrites the stored provider list.
-    "/stop",
-    "/refund",
-    "/refund/xcashu",
-    "/providers",
-    "/providers/enable",
-    "/providers/disable",
+  /**
+   * Endpoints that are admin-only for some methods but readable by any
+   * registered npub for others.
+   *
+   * routstrd answers GET and POST on the same path for its wallet resources, so
+   * a path-only gate cannot express "changing this is admin work, reading it is
+   * not". The mint set is the case that matters: adding a mint or moving the
+   * default decides which mints the wallet trusts, but `routstrd wallet mints
+   * list` must keep working for a non-admin. `/wallet/mints/info` is a
+   * stateless lookup on a URL the caller supplies, so it stays off this list.
+   */
+  static ADMIN_METHODS: ReadonlyMap<string, ReadonlySet<string>> = new Map<
+    string,
+    ReadonlySet<string>
+  >([
+    ["/wallet/mints", new Set(["POST"])],
+    ["/wallet/mints/default", new Set(["POST"])],
+  ]);
+
+  /**
+   * Admin-only path prefixes, for daemon routes that carry a parameter.
+   *
+   * `POST /wallet/send/cashu/<operationId>/mark-spent` settles an offline send
+   * (routstrd 0.5.0). It cannot live in `ADMIN_PATHS` because the operation id
+   * varies, and leaving it out would put settlement below sending: a plain
+   * registered npub cannot send cashu but could mark someone else's send spent.
+   *
+   * The trailing slash keeps `/wallet/send/cashuX` from matching.
+   */
+  static ADMIN_PREFIXES = ["/wallet/send/cashu/"];
+
+  /**
+   * Mirror of Routstr Core's `_ALLOWED_ENDPOINTS` (routstr/proxy.py), which is
+   * the authoritative gate for which method/path pairs may reach an upstream
+   * with the provider credential attached. Core refuses everything outside that
+   * table, so anything listed there is safe for a client key to reach and
+   * anything missing there is dead weight here. Keep the two tables in sync.
+   *
+   * Deliberate differences from core:
+   * - `attestation` / `tee/attestation` are omitted. Core forwards those
+   *   unauthenticated (`_select_unauthenticated_get_upstreams`), so they belong
+   *   in `PUBLIC_PATHS`, not in a client-key capability list.
+   * - `models` is listed for parity, but `PUBLIC_PATHS` already covers it, so a
+   *   GET never reaches the client-key branch. It is GET-only here exactly as
+   *   in core, which is why `POST /v1/models` stays a 403.
+   *
+   * Core also accepts operator additions via `PROXY_EXTRA_ALLOWED_PATHS`; this
+   * proxy has no equivalent and rejects anything not listed below.
+   */
+  static INFERENCE_ENDPOINTS: ReadonlyMap<string, ReadonlySet<string>> = new Map<
+    string,
+    ReadonlySet<string>
+  >([
+    ["chat/completions", new Set(["POST"])],
+    ["completions", new Set(["POST"])],
+    ["responses", new Set(["POST"])],
+    ["messages", new Set(["POST"])],
+    // Anthropic token counting. Core's allowlist is exact, so the `messages`
+    // entry above does not carry it; Claude Code and the Anthropic SDKs call it
+    // before every request.
+    ["messages/count_tokens", new Set(["POST"])],
+    ["embeddings", new Set(["POST"])],
+    ["systemone", new Set(["POST"])],
+    ["decisions", new Set(["POST"])],
+    ["images/generations", new Set(["POST"])],
+    ["images/edits", new Set(["POST"])],
+    ["images/variations", new Set(["POST"])],
+    ["image/generate", new Set(["POST"])],
+    ["image/edit", new Set(["POST"])],
+    ["image/inpaint", new Set(["POST"])],
+    ["image/upscale", new Set(["POST"])],
+    ["models", new Set(["GET"])],
   ]);
 
   static isPublicPath(path: string): boolean {
@@ -825,15 +1126,59 @@ export class AuthProxy {
     return AuthProxy.PUBLIC_PREFIXES.some((prefix) => path.startsWith(prefix));
   }
 
-  static isAdminPath(path: string): boolean {
-    return AuthProxy.ADMIN_PATHS.has(path);
+  static isAdminPath(method: string, path: string): boolean {
+    return (
+      AuthProxy.ADMIN_PATHS.has(path) ||
+      (AuthProxy.ADMIN_METHODS.get(path)?.has(method.toUpperCase()) ?? false) ||
+      AuthProxy.ADMIN_PREFIXES.some((prefix) => path.startsWith(prefix))
+    );
   }
 
-  static isNpubRestrictedPath(path: string): boolean {
-    return AuthProxy.NPUB_RESTRICTED_PATHS.has(path) || path.startsWith("/nwc/");
+  /**
+   * Canonicalize a request path the way core's `_canonical_api_path` does:
+   * drop one trailing slash, then a leading `v1/`. Callers must screen for
+   * ambiguous spellings first; `/v1//x` and friends are rejected upstream of
+   * this.
+   */
+  static canonicalApiPath(path: string): string {
+    let route = path.slice(1);
+    if (route.endsWith("/")) route = route.slice(0, -1);
+    if (route.startsWith("v1/")) route = route.slice(3);
+    return route;
   }
 
-  static isRestrictedPath(path: string): boolean {
-    return this.isAdminPath(path) || this.isNpubRestrictedPath(path);
+  static isInferencePath(method: string, path: string): boolean {
+    return (
+      AuthProxy.INFERENCE_ENDPOINTS.get(
+        AuthProxy.canonicalApiPath(path),
+      )?.has(method.toUpperCase()) ?? false
+    );
+  }
+
+  /**
+   * Routes that never spend from the wallet: proxy-managed npub/client/usage
+   * endpoints and the daemon's own wallet, NWC, settings, provider, key and
+   * control routes. Any other POST falls through to the paid inference proxy.
+   */
+  static NON_PAID_PREFIXES = [
+    "/npubs",
+    "/clients",
+    "/usage",
+    "/wallet",
+    "/nwc",
+    "/settings",
+    "/providers",
+    "/cooldowns",
+    "/keys",
+    "/stop",
+    "/refund",
+  ];
+
+  /** True for requests that can incur inference spend. */
+  static isPaidRequest(method: string, path: string): boolean {
+    if (method !== "POST") return false;
+    return !AuthProxy.NON_PAID_PREFIXES.some(
+      (prefix) => path === prefix || path.startsWith(`${prefix}/`),
+    );
   }
 }

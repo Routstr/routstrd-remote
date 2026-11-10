@@ -34,6 +34,15 @@ function createTmpDb(): { dbPath: string; cleanup: () => void } {
       role TEXT NOT NULL DEFAULT 'admin' CHECK (role IN ('admin', 'user'))
     )
   `);
+  // Monthly spend limits read the daemon's usage tracking table.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS usage_tracking (
+      id TEXT PRIMARY KEY,
+      timestamp INTEGER NOT NULL,
+      client TEXT,
+      sats_cost REAL NOT NULL
+    )
+  `);
   db.close();
   return { dbPath, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
@@ -47,11 +56,30 @@ function setModels(dbPath: string, models: string[]) {
   db.close();
 }
 
-function setClients(dbPath: string, clients: { clientId: string; name: string; apiKey: string; createdAt: number; lastUsed: number | null }[]) {
+function setClients(dbPath: string, clients: { clientId: string; name: string; apiKey: string; createdAt: number; lastUsed: number | null; ownerNpub?: string }[]) {
   const db = new Database(dbPath);
   db.run(
     "INSERT OR REPLACE INTO sdk_storage (key, value) VALUES ('client_ids', ?)",
     JSON.stringify(clients),
+  );
+  db.close();
+}
+
+function setUsage(
+  dbPath: string,
+  rows: Array<{ client: string; sats: number; timestamp?: number }>,
+) {
+  const db = new Database(dbPath);
+  const insert = db.prepare(
+    "INSERT INTO usage_tracking (id, timestamp, client, sats_cost) VALUES (?, ?, ?, ?)",
+  );
+  rows.forEach((row, index) =>
+    insert.run(
+      `usage-${Date.now()}-${Math.random().toString(36).slice(2)}-${index}`,
+      row.timestamp ?? Date.now(),
+      row.client,
+      row.sats,
+    ),
   );
   db.close();
 }
@@ -280,7 +308,100 @@ describe("npub name endpoints", () => {
     expect(body.role).toBe("admin");
   });
 
-  it("PATCH /npubs clears a name with null", async () => {
+  it("POST /npubs requires a name on bootstrap and leaves the slot claimable", async () => {
+    const res = await proxy.handle(
+      new Request("http://localhost:8008/npubs", {
+        method: "POST",
+        body: JSON.stringify({ pubkey: "ef".repeat(32) }),
+      }),
+    );
+
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.field).toBe("name");
+    expect(body.error).toContain("name");
+
+    // A rejected attempt must not consume the unauthenticated bootstrap slot.
+    const store = new AuthStore(tmp.dbPath);
+    expect(store.countNpubs()).toBe(0);
+    store.close();
+
+    const retry = await proxy.handle(
+      new Request("http://localhost:8008/npubs", {
+        method: "POST",
+        body: JSON.stringify({ pubkey: "ef".repeat(32), name: "Alice" }),
+      }),
+    );
+    expect(retry.status).toBe(201);
+    expect((await retry.json()).role).toBe("admin");
+  });
+
+  it("POST /npubs requires a name when an admin adds an npub", async () => {
+    const secretKey = generateSecretKey();
+    const adminPubkey = getPublicKey(secretKey);
+    const targetPubkey = "ef".repeat(32);
+    const store = new AuthStore(tmp.dbPath);
+    store.addNpub(adminPubkey, "admin", null, "Admin");
+    store.close();
+
+    proxy.close();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    const payload = new TextEncoder().encode(
+      JSON.stringify({ pubkey: targetPubkey, role: "user" }),
+    );
+    const req = new Request("http://localhost:8008/npubs", {
+      method: "POST",
+      body: payload,
+    });
+    const auth = await nip98Authorization(secretKey, req, payload);
+    const res = await proxy.handle(
+      new Request(req.url, { method: "POST", headers: { Authorization: auth }, body: payload }),
+    );
+
+    expect(res.status).toBe(400);
+    const store2 = new AuthStore(tmp.dbPath);
+    expect(store2.getNpubByPubkey(targetPubkey)).toBeUndefined();
+    store2.close();
+  });
+
+  it("POST /npubs rejects a null name", async () => {
+    const res = await proxy.handle(
+      new Request("http://localhost:8008/npubs", {
+        method: "POST",
+        body: JSON.stringify({ pubkey: "ef".repeat(32), name: null }),
+      }),
+    );
+
+    expect(res.status).toBe(400);
+    expect((await res.json()).field).toBe("name");
+  });
+
+  it("POST /npubs rejects a whitespace-only name", async () => {
+    const res = await proxy.handle(
+      new Request("http://localhost:8008/npubs", {
+        method: "POST",
+        body: JSON.stringify({ pubkey: "ef".repeat(32), name: "   " }),
+      }),
+    );
+
+    expect(res.status).toBe(400);
+    expect((await res.json()).field).toBe("name");
+  });
+
+  it("POST /npubs rejects a bare npub string, which carries no name", async () => {
+    const res = await proxy.handle(
+      new Request("http://localhost:8008/npubs", {
+        method: "POST",
+        body: JSON.stringify("ef".repeat(32)),
+      }),
+    );
+
+    expect(res.status).toBe(400);
+    expect((await res.json()).field).toBe("name");
+  });
+
+  it("PATCH /npubs refuses to clear a name with null", async () => {
     const secretKey = generateSecretKey();
     const pubkey = getPublicKey(secretKey);
     const store = new AuthStore(tmp.dbPath);
@@ -302,9 +423,13 @@ describe("npub name endpoints", () => {
       new Request(req.url, { method: "PATCH", headers: { Authorization: auth }, body: payload }),
     );
 
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(400);
     const body = await res.json();
-    expect(body.name).toBeNull();
+    expect(body.field).toBe("name");
+
+    const store2 = new AuthStore(tmp.dbPath);
+    expect(store2.getNpubByPubkey(pubkey)?.name).toBe("Alice");
+    store2.close();
   });
 
   it("POST /npubs returns 409 for a duplicate npub", async () => {
@@ -422,7 +547,7 @@ describe("npub name endpoints", () => {
     expect(body.name).toBe("Bob");
   });
 
-  it("PATCH /npubs clears a name with a whitespace-only value", async () => {
+  it("PATCH /npubs refuses to clear a name with a whitespace-only value", async () => {
     const secretKey = generateSecretKey();
     const pubkey = getPublicKey(secretKey);
     const store = new AuthStore(tmp.dbPath);
@@ -444,8 +569,70 @@ describe("npub name endpoints", () => {
       new Request(req.url, { method: "PATCH", headers: { Authorization: auth }, body: payload }),
     );
 
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.field).toBe("name");
+
+    const store2 = new AuthStore(tmp.dbPath);
+    expect(store2.getNpubByPubkey(pubkey)?.name).toBe("Alice");
+    store2.close();
+  });
+
+  it("PATCH /npubs can name a legacy npub that has no name", async () => {
+    const secretKey = generateSecretKey();
+    const adminPubkey = getPublicKey(secretKey);
+    const legacyPubkey = "ab".repeat(32);
+    const store = new AuthStore(tmp.dbPath);
+    store.addNpub(adminPubkey, "admin", null, "Admin");
+    store.addNpub(legacyPubkey, "user", adminPubkey);
+    store.close();
+
+    proxy.close();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    const payload = new TextEncoder().encode(
+      JSON.stringify({ pubkey: legacyPubkey, name: "Legacy Person" }),
+    );
+    const req = new Request("http://localhost:8008/npubs", {
+      method: "PATCH",
+      body: payload,
+    });
+    const auth = await nip98Authorization(secretKey, req, payload);
+    const res = await proxy.handle(
+      new Request(req.url, { method: "PATCH", headers: { Authorization: auth }, body: payload }),
+    );
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).name).toBe("Legacy Person");
+  });
+
+  it("PATCH /npubs updates a role without requiring a name", async () => {
+    const secretKey = generateSecretKey();
+    const adminPubkey = getPublicKey(secretKey);
+    const legacyPubkey = "cd".repeat(32);
+    const store = new AuthStore(tmp.dbPath);
+    store.addNpub(adminPubkey, "admin", null, "Admin");
+    store.addNpub(legacyPubkey, "user", adminPubkey);
+    store.close();
+
+    proxy.close();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    const payload = new TextEncoder().encode(
+      JSON.stringify({ pubkey: legacyPubkey, role: "admin" }),
+    );
+    const req = new Request("http://localhost:8008/npubs", {
+      method: "PATCH",
+      body: payload,
+    });
+    const auth = await nip98Authorization(secretKey, req, payload);
+    const res = await proxy.handle(
+      new Request(req.url, { method: "PATCH", headers: { Authorization: auth }, body: payload }),
+    );
+
     expect(res.status).toBe(200);
     const body = await res.json();
+    expect(body.role).toBe("admin");
     expect(body.name).toBeNull();
   });
 });
@@ -483,6 +670,7 @@ describe("Model Allowlist Enforcement (AUTH-001)", () => {
       expect(res.status).toBe(200);
       expect(upstream.calls).toHaveLength(1);
       expect(upstream.calls[0]!.headers.get("x-api-key")).toBe(TEST_API_KEY);
+      expect(upstream.calls[0]!.headers.get("authorization")).toBe(`Bearer ${TEST_API_KEY}`);
       expect(upstream.calls[0]!.url).toBe("http://localhost:9999/v1/messages");
       expect(JSON.parse(upstream.calls[0]!.body!).model).toBe(TEST_MODELS[1]);
     });
@@ -529,6 +717,31 @@ describe("Model Allowlist Enforcement (AUTH-001)", () => {
     it("prefers valid Bearer auth over an invalid x-api-key", async () => {
       proxy = new AuthProxy(makeConfig(tmp.dbPath));
       expect((await proxy.handle(request({ Authorization: `Bearer ${TEST_API_KEY}`, "x-api-key": "invalid" }))).status).toBe(200);
+      expect(upstream.calls[0]!.headers.get("authorization")).toBe(`Bearer ${TEST_API_KEY}`);
+      expect(upstream.calls[0]!.headers.get("x-api-key")).toBe(TEST_API_KEY);
+    });
+
+    it("canonicalizes accepted Bearer spellings for downstream spend attribution", async () => {
+      for (const modelAllowlistEnabled of [true, false]) {
+        proxy = new AuthProxy(makeConfig(tmp.dbPath, { modelAllowlistEnabled }));
+        for (const authorization of [
+          `bearer ${TEST_API_KEY}`,
+          `bEaReR ${TEST_API_KEY}`,
+          `Bearer  ${TEST_API_KEY}`,
+          `Bearer\t${TEST_API_KEY}`,
+        ]) {
+          const res = await proxy.handle(request({ Authorization: authorization }));
+          expect(res.status).toBe(200);
+          const forwarded = upstream.calls.at(-1)!;
+          expect(forwarded.headers.get("authorization")).toBe(`Bearer ${TEST_API_KEY}`);
+          expect(forwarded.headers.get("authorization")!.slice(7)).toBe(TEST_API_KEY);
+          expect(forwarded.body).toBe(modelAllowlistEnabled
+            ? JSON.stringify({ model: TEST_MODELS[1], messages: [], max_tokens: 16 })
+            : "[stream]");
+        }
+        proxy.close();
+      }
+      expect(upstream.calls).toHaveLength(8);
     });
 
     it("allows Anthropic headers in browser preflights without forwarding", async () => {
@@ -784,4 +997,793 @@ describe("Model Allowlist Enforcement (AUTH-001)", () => {
       badTmp.cleanup();
     });
   });
+});
+describe("daemon route capability boundary", () => {
+  const inferenceFamilies = [
+    "chat/completions",
+    "completions",
+    "responses",
+    "messages",
+    "messages/count_tokens",
+    "embeddings",
+    "systemone",
+    "decisions",
+    "images/generations",
+    "images/edits",
+    "images/variations",
+    "image/generate",
+    "image/edit",
+    "image/inpaint",
+    "image/upscale",
+  ];
+  let tmp: { dbPath: string; cleanup: () => void };
+  let upstream: ReturnType<typeof mockFetchUpstream>;
+  let proxy: AuthProxy;
+
+  beforeEach(() => {
+    tmp = createTmpDb();
+    setClients(tmp.dbPath, [TEST_CLIENT]);
+    upstream = mockFetchUpstream();
+    proxy = new AuthProxy(
+      makeConfig(tmp.dbPath, { modelAllowlistEnabled: false }),
+    );
+  });
+
+  afterEach(() => {
+    proxy.close();
+    upstream.restore();
+    tmp.cleanup();
+  });
+
+  function registerNpub(role: "admin" | "user"): Uint8Array {
+    const secretKey = generateSecretKey();
+    const store = new AuthStore(tmp.dbPath);
+    store.addNpub(getPublicKey(secretKey), role, null);
+    store.close();
+    return secretKey;
+  }
+
+  async function signedRequest(
+    secretKey: Uint8Array,
+    method: string,
+    path: string,
+    bodyText?: string,
+  ): Promise<Request> {
+    const body = bodyText === undefined
+      ? undefined
+      : new TextEncoder().encode(bodyText);
+    const url = `http://localhost:8008${path}`;
+    const unsigned = new Request(url, { method, body });
+    const authorization = await nip98Authorization(secretKey, unsigned, body);
+    return new Request(url, {
+      method,
+      headers: { Authorization: authorization },
+      body,
+    });
+  }
+
+  function clientRequest(
+    method: string,
+    path: string,
+    carrier: "bearer" | "x-api-key" = "bearer",
+  ): Request {
+    const body = method === "GET" || method === "HEAD"
+      ? undefined
+      : JSON.stringify({ model: "routstr/test" });
+    const headers = carrier === "bearer"
+      ? { Authorization: `Bearer ${TEST_API_KEY}` }
+      : { "x-api-key": TEST_API_KEY };
+    return new Request(`http://localhost:8008${path}`, {
+      method,
+      headers,
+      body,
+    });
+  }
+
+  it("allows the complete client inference contract", async () => {
+    const paths = [
+      ...inferenceFamilies.map((family) => `/v1/${family}`),
+      "/chat/completions",
+      "/v1/chat/completions/",
+    ];
+
+    for (const path of paths) {
+      expect((await proxy.handle(clientRequest("POST", path))).status).toBe(200);
+    }
+    expect(upstream.calls).toHaveLength(paths.length);
+    expect(upstream.calls.every(
+      (call) => call.headers.get("authorization") === `Bearer ${TEST_API_KEY}`,
+    )).toBe(true);
+
+    const anthropic = await proxy.handle(
+      clientRequest("POST", "/v1/messages/count_tokens", "x-api-key"),
+    );
+    expect(anthropic.status).toBe(200);
+    expect(upstream.calls.at(-1)!.headers.get("x-api-key")).toBe(TEST_API_KEY);
+    // Also sent as a canonical Bearer header so the daemon can attribute spend
+    // to the owning npub, which is what makes monthly quotas enforceable for
+    // x-api-key clients.
+    expect(upstream.calls.at(-1)!.headers.get("authorization")).toBe(
+      `Bearer ${TEST_API_KEY}`,
+    );
+  });
+
+  it("blocks client keys from non-inference routes", async () => {
+    const routes = [
+      ["GET", "/keys/api", "bearer"],
+      ["GET", "/keys/api?include=all", "x-api-key"],
+      ["DELETE", "/keys/api/delete?baseUrl=https%3A%2F%2Fprovider.invalid", "bearer"],
+      ["POST", "/future/admin", "bearer"],
+      ["GET", "/v1/chat/completions", "bearer"],
+      ["POST", "/v1/chat/completions/admin", "bearer"],
+      ["POST", "/v1//chat/completions", "bearer"],
+      ["POST", "/v1/chat/completions//", "bearer"],
+      // Core allows GET only on `models`, and omits attestation entirely.
+      ["POST", "/v1/models", "bearer"],
+      ["POST", "/v1/attestation", "bearer"],
+      ["GET", "/v1/tee/attestation", "bearer"],
+      // Prototype keys must not resolve through the capability table.
+      ["POST", "/v1/constructor", "bearer"],
+      ["POST", "/v1/toString", "bearer"],
+    ] as const;
+
+    for (const [method, path, carrier] of routes) {
+      const res = await proxy.handle(clientRequest(method, path, carrier));
+      expect(res.status).toBe(403);
+    }
+    expect(upstream.calls).toHaveLength(0);
+  });
+
+  it("scopes methods per endpoint the way Routstr Core does", () => {
+    // Source of truth: _ALLOWED_ENDPOINTS in routstr-core/routstr/proxy.py.
+    expect(AuthProxy.isInferencePath("GET", "/v1/models")).toBe(true);
+    expect(AuthProxy.isInferencePath("get", "/models")).toBe(true);
+    expect(AuthProxy.isInferencePath("POST", "/v1/models")).toBe(false);
+    expect(AuthProxy.isInferencePath("POST", "/v1/embeddings")).toBe(true);
+    expect(AuthProxy.isInferencePath("GET", "/v1/embeddings")).toBe(false);
+    expect(AuthProxy.isInferencePath("PUT", "/v1/images/generations")).toBe(false);
+    expect(AuthProxy.isInferencePath("GET", "/v1/attestation")).toBe(false);
+    expect(AuthProxy.isInferencePath("GET", "/v1/tee/attestation")).toBe(false);
+    // A Map lookup, so inherited object keys cannot satisfy the table.
+    expect(AuthProxy.isInferencePath("POST", "/v1/constructor")).toBe(false);
+    expect(AuthProxy.isInferencePath("POST", "/v1/hasOwnProperty")).toBe(false);
+    // Canonicalization matches core: one trailing slash and one `v1/` prefix.
+    expect(AuthProxy.canonicalApiPath("/v1/messages/count_tokens/")).toBe(
+      "messages/count_tokens",
+    );
+    expect(AuthProxy.canonicalApiPath("/messages/count_tokens")).toBe(
+      "messages/count_tokens",
+    );
+  });
+
+  it("refuses unscoped usage paths instead of forwarding them", async () => {
+    const secretKey = registerNpub("user");
+    const paths = [
+      "/usagePi",
+      "/usagePi?timestamp=1750000000",
+      "/usage/raw",
+    ];
+
+    for (const path of paths) {
+      // A registered npub would otherwise be forwarded straight to the daemon,
+      // which answers without applying the `npub` filter the proxy injects.
+      const signed = await proxy.handle(
+        await signedRequest(secretKey, "GET", path),
+      );
+      expect(signed.status).toBe(404);
+
+      const bearer = await proxy.handle(clientRequest("GET", path));
+      expect(bearer.status).toBe(404);
+    }
+    expect(upstream.calls).toHaveLength(0);
+
+    // The scoped routes are untouched: they still reach the daemon, with the
+    // caller's npub on the query string.
+    const scoped = await proxy.handle(
+      await signedRequest(secretKey, "GET", "/usage"),
+    );
+    expect(scoped.status).toBe(200);
+    expect(upstream.calls).toHaveLength(1);
+    expect(upstream.calls[0]!.url).toContain("npub=npub1");
+  });
+
+  it("requires admin NIP-98 for provider keys and wallet sends", async () => {
+    const userSecret = registerNpub("user");
+    const adminSecret = registerNpub("admin");
+    const routes = [
+      ["GET", "/keys/api?include=all", undefined],
+      ["POST", "/keys/api/delete", JSON.stringify({ baseUrl: "https://provider.invalid" })],
+      ["DELETE", "/keys/api/delete?baseUrl=https%3A%2F%2Fprovider.invalid", undefined],
+      ["POST", "/wallet/send/cashu", "{}"],
+      ["POST", "/wallet/send/bolt11", "{}"],
+    ] as const;
+
+    for (const [method, path, body] of routes) {
+      const denied = await proxy.handle(
+        await signedRequest(userSecret, method, path, body),
+      );
+      expect(denied.status).toBe(403);
+
+      const allowed = await proxy.handle(
+        await signedRequest(adminSecret, method, path, body),
+      );
+      expect(allowed.status).toBe(200);
+    }
+    expect(upstream.calls).toHaveLength(routes.length);
+    expect(upstream.calls.every(
+      (call) => call.headers.get("authorization") === null,
+    )).toBe(true);
+  });
+
+  it("requires admin NIP-98 for the offline-send settlement routes", async () => {
+    // Both move value, and both are new in routstrd 0.5.0. `mark-spent` carries
+    // an operation id, so it is matched by prefix rather than by exact path.
+    const userSecret = registerNpub("user");
+    const adminSecret = registerNpub("admin");
+    const routes = [
+      ["POST", "/wallet/sweep-offline", JSON.stringify({ dryRun: true })],
+      ["POST", "/wallet/send/cashu/op1/mark-spent", "{}"],
+    ] as const;
+
+    for (const [method, path, body] of routes) {
+      const denied = await proxy.handle(
+        await signedRequest(userSecret, method, path, body),
+      );
+      expect(denied.status).toBe(403);
+
+      const allowed = await proxy.handle(
+        await signedRequest(adminSecret, method, path, body),
+      );
+      expect(allowed.status).toBe(200);
+    }
+    expect(upstream.calls).toHaveLength(routes.length);
+  });
+
+  it("requires admin NIP-98 for wallet integrity and recovery routes", async () => {
+    const userSecret = registerNpub("user");
+    const adminSecret = registerNpub("admin");
+    const routes = [
+      ["POST", "/wallet/unlock", "{}"],
+      ["POST", "/wallet/mints", JSON.stringify({ url: "https://mint.invalid" })],
+      ["POST", "/wallet/mints/default", JSON.stringify({ url: "https://mint.invalid" })],
+      ["POST", "/wallet/cleanup", JSON.stringify({ dryRun: true })],
+      ["POST", "/wallet/check-proofs", JSON.stringify({ dryRun: true })],
+      ["POST", "/wallet/recover", "{}"],
+      ["POST", "/wallet/recover/operations", "{}"],
+    ] as const;
+
+    for (const [method, path, body] of routes) {
+      const denied = await proxy.handle(
+        await signedRequest(userSecret, method, path, body),
+      );
+      expect(denied.status).toBe(403);
+
+      const allowed = await proxy.handle(
+        await signedRequest(adminSecret, method, path, body),
+      );
+      expect(allowed.status).toBe(200);
+    }
+    expect(upstream.calls).toHaveLength(routes.length);
+  });
+
+  it("leaves wallet reads and diagnostics open to any registered npub", async () => {
+    // The gate is on state change, not on the `/wallet` prefix: reads stay
+    // usable from the CLI for non-admins, and so do the stateless diagnostics.
+    const userSecret = registerNpub("user");
+    const routes = [
+      ["GET", "/wallet/mints", undefined],
+      ["GET", "/wallet/mints/default", undefined],
+      ["POST", "/wallet/mints/info", JSON.stringify({ url: "https://mint.invalid" })],
+      ["GET", "/wallet/history", undefined],
+      ["GET", "/wallet/status", undefined],
+    ] as const;
+
+    for (const [method, path, body] of routes) {
+      const res = await proxy.handle(
+        await signedRequest(userSecret, method, path, body),
+      );
+      expect(res.status).toBe(200);
+    }
+    expect(upstream.calls).toHaveLength(routes.length);
+  });
+
+  it("matches admin prefixes only on a full path segment", () => {
+    expect(AuthProxy.isAdminPath("POST", "/wallet/send/cashu/op1/mark-spent")).toBe(true);
+    expect(AuthProxy.isAdminPath("POST", "/wallet/send/cashu/")).toBe(true);
+    // The trailing slash in the prefix is load-bearing: a lookalike route one
+    // segment over must not inherit admin-only treatment.
+    expect(AuthProxy.isAdminPath("POST", "/wallet/send/cashuX")).toBe(false);
+    expect(AuthProxy.isAdminPath("POST", "/wallet/send")).toBe(false);
+    // Reads and non-mutating wallet routes stay open to any registered npub.
+    expect(AuthProxy.isAdminPath("POST", "/wallet/balance")).toBe(false);
+    // Not a read despite the name: it marks proofs spent by default.
+    expect(AuthProxy.isAdminPath("POST", "/requests")).toBe(false);
+    // State-changing wallet routes are admin-only, and matching is exact, so a
+    // read of the same resource (`GET /wallet/mints`) is a separate entry.
+    expect(AuthProxy.isAdminPath("POST", "/wallet/unlock")).toBe(true);
+    expect(AuthProxy.isAdminPath("POST", "/wallet/mints")).toBe(true);
+    expect(AuthProxy.isAdminPath("POST", "/wallet/mints/default")).toBe(true);
+    expect(AuthProxy.isAdminPath("POST", "/wallet/cleanup")).toBe(true);
+    expect(AuthProxy.isAdminPath("POST", "/wallet/check-proofs")).toBe(true);
+    expect(AuthProxy.isAdminPath("POST", "/wallet/recover")).toBe(true);
+    expect(AuthProxy.isAdminPath("POST", "/wallet/recover/operations")).toBe(true);
+    expect(AuthProxy.isAdminPath("POST", "/wallet/recoverX")).toBe(false);
+    // Method-aware entries: changing the mint set is admin work, reading it is
+    // not, and the daemon serves both on the same path.
+    expect(AuthProxy.isAdminPath("GET", "/wallet/mints")).toBe(false);
+    expect(AuthProxy.isAdminPath("GET", "/wallet/mints/default")).toBe(false);
+    expect(AuthProxy.isAdminPath("HEAD", "/wallet/mints")).toBe(false);
+    expect(AuthProxy.isAdminPath("PUT", "/wallet/mints")).toBe(false);
+    // Lowercase methods are normalized, matching isInferencePath.
+    expect(AuthProxy.isAdminPath("post", "/wallet/mints")).toBe(true);
+  });
+
+  it("preserves existing registered-user daemon access", async () => {
+    const secretKey = registerNpub("user");
+    const routes = [
+      ["POST", "/v1/messages/count_tokens", JSON.stringify({ model: "routstr/test" })],
+      ["POST", "/stop", "{}"],
+      ["GET", "/providers?refresh=true", undefined],
+      ["POST", "/nwc/fund", "{}"],
+    ] as const;
+
+    for (const [method, path, body] of routes) {
+      const res = await proxy.handle(
+        await signedRequest(secretKey, method, path, body),
+      );
+      expect(res.status).toBe(200);
+    }
+    expect(upstream.calls).toHaveLength(routes.length);
+    expect(upstream.calls.every(
+      (call) => call.headers.get("authorization") === null,
+    )).toBe(true);
+  });
+
+  it("rejects the leading-double-slash authorization bypass", async () => {
+    const secretKey = registerNpub("user");
+    const res = await proxy.handle(
+      await signedRequest(secretKey, "GET", "//keys/api"),
+    );
+
+    expect(res.status).toBe(400);
+    expect(upstream.calls).toHaveLength(0);
+  });
+});
+
+describe("Monthly spend limits", () => {
+  let tmp: { dbPath: string; cleanup: () => void };
+  let upstream: ReturnType<typeof mockFetchUpstream>;
+  let proxy: AuthProxy;
+
+  beforeEach(() => {
+    tmp = createTmpDb();
+    upstream = mockFetchUpstream();
+  });
+
+  afterEach(() => {
+    proxy?.close();
+    upstream.restore();
+    tmp.cleanup();
+  });
+
+  /**
+   * Register an npub plus one API-key client owned by it. `spent` is written as
+   * usage for the current month.
+   */
+  function setupNpub(options: {
+    role?: "admin" | "user";
+    limit?: number | null;
+    spent?: number;
+    clientId?: string;
+  } = {}) {
+    const secretKey = generateSecretKey();
+    const pubkey = getPublicKey(secretKey);
+    const store = new AuthStore(tmp.dbPath);
+    const entry = store.addNpub(
+      pubkey,
+      options.role ?? "user",
+      null,
+      "Alice",
+      options.limit === undefined ? null : options.limit,
+    );
+    const apiKey = `sk-quota-${pubkey.slice(0, 8)}`;
+    const clientId = options.clientId ?? `pi-agent-${entry.npub.slice(-7)}`;
+    setClients(tmp.dbPath, [
+      {
+        clientId,
+        name: "Pi Agent",
+        apiKey,
+        createdAt: 1,
+        lastUsed: null,
+        ownerNpub: entry.npub,
+      },
+    ]);
+    if (options.spent) {
+      setUsage(tmp.dbPath, [{ client: clientId, sats: options.spent }]);
+    }
+    store.close();
+    return { secretKey, pubkey, npub: entry.npub, apiKey, clientId };
+  }
+
+  function paidBearerRequest(apiKey: string, path = "/v1/chat/completions") {
+    return new Request(`http://localhost:8008${path}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model: "routstr/gpt-4o", messages: [] }),
+    });
+  }
+
+  async function paidNip98Request(secretKey: Uint8Array, path = "/v1/chat/completions") {
+    const body = new TextEncoder().encode(
+      JSON.stringify({ model: "routstr/gpt-4o", messages: [] }),
+    );
+    const req = new Request(`http://localhost:8008${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    });
+    const authorization = await nip98Authorization(secretKey, req, body);
+    return new Request(req.url, {
+      method: "POST",
+      headers: { Authorization: authorization, "Content-Type": "application/json" },
+      body,
+    });
+  }
+
+  it("returns 503 for capped inference on missing or broken accounting and recovers", async () => {
+    const { apiKey } = setupNpub({ limit: 1_000 });
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+    const db = new Database(tmp.dbPath);
+    const log = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      for (const schema of [null, "CREATE TABLE usage_tracking (timestamp INTEGER, client TEXT)"]) {
+        db.run("DROP TABLE IF EXISTS usage_tracking");
+        if (schema) db.run(schema);
+        const res = await proxy.handle(paidBearerRequest(apiKey));
+        expect(res.status).toBe(503);
+        expect((await res.json()).code).toBe("quota_accounting_unavailable");
+        expect(upstream.calls).toHaveLength(0);
+      }
+      db.run("DROP TABLE usage_tracking");
+      db.run("CREATE TABLE usage_tracking (timestamp INTEGER, client TEXT, sats_cost REAL)");
+      expect((await proxy.handle(paidBearerRequest(apiKey))).status).toBe(200);
+      expect(upstream.calls).toHaveLength(1);
+      expect(log).toHaveBeenCalled();
+    } finally {
+      log.mockRestore();
+      db.close();
+    }
+  });
+
+  it("keeps unlimited inference and capped management available without accounting", async () => {
+    const { apiKey, secretKey } = setupNpub({ role: "admin", limit: null });
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+    const db = new Database(tmp.dbPath);
+    db.run("DROP TABLE usage_tracking");
+    db.close();
+    const log = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect((await proxy.handle(paidBearerRequest(apiKey))).status).toBe(200);
+      const store = new AuthStore(tmp.dbPath);
+      store.updateNpubMonthlyLimit(getPublicKey(secretKey), 1_000);
+      store.close();
+      expect((await proxy.handle(await paidNip98Request(secretKey, "/wallet/unlock"))).status).toBe(200);
+
+      const req = new Request("http://localhost:8008/npubs");
+      const authorization = await nip98Authorization(secretKey, req);
+      const res = await proxy.handle(new Request(req.url, { headers: { Authorization: authorization } }));
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data.npubs[0].monthlyLimitSats).toBe(1_000);
+      expect(data.npubs[0].monthlyUsedSats).toBeUndefined();
+
+      const body = new TextEncoder().encode(JSON.stringify({ pubkey: getPublicKey(secretKey), monthlyLimitSats: null }));
+      const patch = new Request(req.url, { method: "PATCH", body });
+      const auth = await nip98Authorization(secretKey, patch, body);
+      const updated = await proxy.handle(new Request(req.url, {
+        method: "PATCH", headers: { Authorization: auth }, body,
+      }));
+      expect(updated.status).toBe(200);
+      expect((await updated.json()).monthlyLimitSats).toBeNull();
+    } finally { log.mockRestore(); }
+  });
+
+  it("allows a paid Bearer request below the cap", async () => {
+    const { apiKey } = setupNpub({ limit: 1_000, spent: 500 });
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    const res = await proxy.handle(paidBearerRequest(apiKey));
+    expect(res.status).toBe(200);
+    expect(upstream.calls).toHaveLength(1);
+  });
+
+  it("blocks a paid Bearer request once the cap is reached", async () => {
+    const { apiKey, npub } = setupNpub({ limit: 1_000, spent: 1_000 });
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    const res = await proxy.handle(paidBearerRequest(apiKey));
+    expect(res.status).toBe(402);
+    expect(upstream.calls).toHaveLength(0);
+
+    const body = await res.json();
+    expect(body.code).toBe("monthly_quota_exceeded");
+    expect(body.monthlyLimitSats).toBe(1_000);
+    expect(body.monthlyUsedSats).toBe(1_000);
+    expect(body.error).toContain(npub);
+    expect(res.headers.get("X-Routstr-Quota-Limit-Sats")).toBe("1000");
+    expect(res.headers.get("X-Routstr-Quota-Used-Sats")).toBe("1000");
+    expect(Number(res.headers.get("X-Routstr-Quota-Reset"))).toBeGreaterThan(Date.now() / 1000);
+    expect(res.headers.get("Retry-After")).toMatch(/^\d+$/);
+  });
+
+  it("blocks when spend exceeds the cap by a fraction of a sat", async () => {
+    const { apiKey } = setupNpub({ limit: 100, spent: 100.5 });
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    expect((await proxy.handle(paidBearerRequest(apiKey))).status).toBe(402);
+    expect(upstream.calls).toHaveLength(0);
+  });
+
+  it("does not count last month's spend", async () => {
+    const { apiKey, clientId } = setupNpub({ limit: 100 });
+    const lastMonth = Date.now() - 40 * 24 * 60 * 60 * 1000;
+    setUsage(tmp.dbPath, [{ client: clientId, sats: 10_000, timestamp: lastMonth }]);
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    expect((await proxy.handle(paidBearerRequest(apiKey))).status).toBe(200);
+  });
+
+  it("treats a null limit as unlimited", async () => {
+    const { apiKey } = setupNpub({ limit: null, spent: 1_000_000 });
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    expect((await proxy.handle(paidBearerRequest(apiKey))).status).toBe(200);
+  });
+
+  it("treats a limit of 0 as blocking immediately", async () => {
+    const { apiKey } = setupNpub({ limit: 0 });
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    expect((await proxy.handle(paidBearerRequest(apiKey))).status).toBe(402);
+  });
+
+  it("sums spend across every client owned by the npub", async () => {
+    const { apiKey, npub } = setupNpub({ limit: 100, spent: 60 });
+    setClients(tmp.dbPath, [
+      {
+        clientId: `pi-agent-${npub.slice(-7)}`,
+        name: "Pi Agent",
+        apiKey,
+        createdAt: 1,
+        lastUsed: null,
+        ownerNpub: npub,
+      },
+      {
+        clientId: `claude-code-${npub.slice(-7)}`,
+        name: "Claude Code",
+        apiKey: "sk-second-client",
+        createdAt: 1,
+        lastUsed: null,
+        ownerNpub: npub,
+      },
+    ]);
+    setUsage(tmp.dbPath, [
+      { client: `claude-code-${npub.slice(-7)}`, sats: 50 },
+    ]);
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    expect((await proxy.handle(paidBearerRequest(apiKey))).status).toBe(402);
+  });
+
+  it("does not block another npub's paid requests", async () => {
+    setupNpub({ limit: 10, spent: 1_000 });
+    const other = setupNpub({ limit: 1_000, spent: 10 });
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    expect((await proxy.handle(paidBearerRequest(other.apiKey))).status).toBe(200);
+  });
+
+  it("does not block non-paid management routes", async () => {
+    const { secretKey } = setupNpub({ role: "admin", limit: 0, spent: 1_000 });
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    const res = await proxy.handle(await paidNip98Request(secretKey, "/wallet/unlock"));
+    expect(res.status).toBe(200);
+    expect(upstream.calls).toHaveLength(1);
+  });
+
+  it("blocks a paid NIP-98 request once the cap is reached", async () => {
+    const { secretKey } = setupNpub({ limit: 500, spent: 900 });
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    const res = await proxy.handle(await paidNip98Request(secretKey));
+    expect(res.status).toBe(403);
+    expect((await res.json()).code).toBe("capped_npub_requires_api_key");
+    expect(upstream.calls).toHaveLength(0);
+  });
+
+  it("rejects paid NIP-98 for capped npubs even below the cap or with zero spend", async () => {
+    for (const limit of [0, 500]) {
+      const { secretKey } = setupNpub({ limit });
+      proxy = new AuthProxy(makeConfig(tmp.dbPath));
+      const res = await proxy.handle(await paidNip98Request(secretKey));
+      expect(res.status).toBe(403);
+      expect((await res.json()).code).toBe("capped_npub_requires_api_key");
+      proxy.close();
+    }
+    expect(upstream.calls).toHaveLength(0);
+  });
+
+  it("allows paid NIP-98 for unlimited npubs", async () => {
+    const { secretKey } = setupNpub({ limit: null });
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+    expect((await proxy.handle(await paidNip98Request(secretKey))).status).toBe(200);
+    expect(upstream.calls).toHaveLength(1);
+  });
+
+  it("POST /npubs accepts a monthly limit on creation", async () => {
+    const pubkey = "ef".repeat(32);
+    const res = await proxyWithoutDb().handle(
+      new Request("http://localhost:8008/npubs", {
+        method: "POST",
+        body: JSON.stringify({ pubkey, name: "Alice", monthlyLimitSats: 2_500 }),
+      }),
+    );
+    expect(res.status).toBe(201);
+    expect((await res.json()).monthlyLimitSats).toBe(2_500);
+  });
+
+  it("PATCH /npubs sets, updates and clears the monthly limit", async () => {
+    const { secretKey, pubkey } = setupNpub({ role: "admin" });
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    const patch = async (monthlyLimitSats: number | null) => {
+      const payload = new TextEncoder().encode(
+        JSON.stringify({ pubkey, monthlyLimitSats }),
+      );
+      const req = new Request("http://localhost:8008/npubs", {
+        method: "PATCH",
+        body: payload,
+      });
+      const auth = await nip98Authorization(secretKey, req, payload);
+      return proxy.handle(
+        new Request(req.url, {
+          method: "PATCH",
+          headers: { Authorization: auth },
+          body: payload,
+        }),
+      );
+    };
+
+    const set = await patch(7_500);
+    expect(set.status).toBe(200);
+    expect((await set.json()).monthlyLimitSats).toBe(7_500);
+
+    const cleared = await patch(null);
+    expect(cleared.status).toBe(200);
+    expect((await cleared.json()).monthlyLimitSats).toBeNull();
+  });
+
+  it("PATCH /npubs rejects invalid monthly limits", async () => {
+    const { secretKey, pubkey } = setupNpub({ role: "admin" });
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    for (const monthlyLimitSats of [-1, 1.5, "1000"]) {
+      const payload = new TextEncoder().encode(
+        JSON.stringify({ pubkey, monthlyLimitSats }),
+      );
+      const req = new Request("http://localhost:8008/npubs", {
+        method: "PATCH",
+        body: payload,
+      });
+      const auth = await nip98Authorization(secretKey, req, payload);
+      const res = await proxy.handle(
+        new Request(req.url, {
+          method: "PATCH",
+          headers: { Authorization: auth },
+          body: payload,
+        }),
+      );
+      expect(res.status).toBe(400);
+    }
+  });
+
+  it("GET /npubs returns each npub's limit and current-month spend", async () => {
+    const secretKey = generateSecretKey();
+    const adminPubkey = getPublicKey(secretKey);
+    const store = new AuthStore(tmp.dbPath);
+    store.addNpub(adminPubkey, "admin");
+    const target = store.addNpub("ef".repeat(32), "user", adminPubkey, "Bob", 4_000);
+    const clientId = `pi-agent-${target.npub.slice(-7)}`;
+    setClients(tmp.dbPath, [
+      {
+        clientId,
+        name: "Pi Agent",
+        apiKey: "sk-target",
+        createdAt: 1,
+        lastUsed: null,
+        ownerNpub: target.npub,
+      },
+    ]);
+    setUsage(tmp.dbPath, [{ client: clientId, sats: 1_234.9 }]);
+    store.close();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    const req = new Request("http://localhost:8008/npubs");
+    const auth = await nip98Authorization(secretKey, req);
+    const res = await proxy.handle(
+      new Request(req.url, { headers: { Authorization: auth } }),
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    const bob = body.npubs.find((n: { npub: string }) => n.npub === target.npub);
+    expect(bob.monthlyLimitSats).toBe(4_000);
+    expect(bob.monthlyUsedSats).toBe(1_234);
+    expect(body.monthlyResetAt).toBeGreaterThan(Date.now() / 1000);
+  });
+
+  it("hides other members' spend from a non-admin", async () => {
+    const adminKey = generateSecretKey();
+    const adminPubkey = getPublicKey(adminKey);
+    const memberKey = generateSecretKey();
+    const memberPubkey = getPublicKey(memberKey);
+    const store = new AuthStore(tmp.dbPath);
+    const admin = store.addNpub(adminPubkey, "admin");
+    const member = store.addNpub(memberPubkey, "user");
+    setClients(tmp.dbPath, [
+      {
+        clientId: `pi-agent-${admin.npub.slice(-7)}`,
+        name: "Admin Pi",
+        apiKey: "sk-admin",
+        createdAt: 1,
+        lastUsed: null,
+        ownerNpub: admin.npub,
+      },
+      {
+        clientId: `pi-agent-${member.npub.slice(-7)}`,
+        name: "Member Pi",
+        apiKey: "sk-member",
+        createdAt: 1,
+        lastUsed: null,
+        ownerNpub: member.npub,
+      },
+    ]);
+    setUsage(tmp.dbPath, [
+      { client: `pi-agent-${admin.npub.slice(-7)}`, sats: 111 },
+      { client: `pi-agent-${member.npub.slice(-7)}`, sats: 222 },
+    ]);
+    store.close();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    const listAs = async (secretKey: Uint8Array) => {
+      const req = new Request("http://localhost:8008/npubs");
+      const auth = await nip98Authorization(secretKey, req);
+      const res = await proxy.handle(
+        new Request(req.url, { headers: { Authorization: auth } }),
+      );
+      expect(res.status).toBe(200);
+      return (await res.json()) as {
+        npubs: Array<{ npub: string; monthlyUsedSats?: number }>;
+      };
+    };
+
+    const asMember = await listAs(memberKey);
+    const own = asMember.npubs.find((n) => n.npub === member.npub)!;
+    const other = asMember.npubs.find((n) => n.npub === admin.npub)!;
+    expect(own.monthlyUsedSats).toBe(222);
+    expect(other.monthlyUsedSats).toBeUndefined();
+
+    const asAdmin = await listAs(adminKey);
+    expect(
+      asAdmin.npubs.find((n) => n.npub === member.npub)!.monthlyUsedSats,
+    ).toBe(222);
+  });
+
+  function proxyWithoutDb() {
+    return new AuthProxy(makeConfig(tmp.dbPath));
+  }
 });
