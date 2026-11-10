@@ -120,6 +120,38 @@ vulnerabilities:
       is nothing to bump here. Owner: Cloudron base image / Ubuntu kernel team.
     expiredAt: "2027-01-31"
   # gosu (Go stdlib) — needs a Cloudron rebuild of the helper
+  - id: CVE-2026-74478
+    statement: >-
+      Inherited from cloudron/base:6.0.1. linux-libc-dev ships kernel UAPI headers only: no
+      kernel code from it is executed by this app, and the running kernel is the Cloudron
+      host's, which Cloudron patches. Ubuntu has published a fixed header package
+      (7.0.0-42.42), so this clears on the next cloudron/base rebuild. Advisory appeared after
+      0.2.0's first gate run against the same base digest. Owner: Cloudron base image.
+    expiredAt: "2027-01-31"
+  - id: CVE-2026-74587
+    statement: >-
+      Inherited from cloudron/base:6.0.1. linux-libc-dev ships kernel UAPI headers only: no
+      kernel code from it is executed by this app, and the running kernel is the Cloudron
+      host's, which Cloudron patches. Ubuntu has published a fixed header package
+      (7.0.0-42.42), so this clears on the next cloudron/base rebuild. Advisory appeared after
+      0.2.0's first gate run against the same base digest. Owner: Cloudron base image.
+    expiredAt: "2027-01-31"
+  - id: CVE-2026-74588
+    statement: >-
+      Inherited from cloudron/base:6.0.1. linux-libc-dev ships kernel UAPI headers only: no
+      kernel code from it is executed by this app, and the running kernel is the Cloudron
+      host's, which Cloudron patches. Ubuntu has published a fixed header package
+      (7.0.0-42.42), so this clears on the next cloudron/base rebuild. Advisory appeared after
+      0.2.0's first gate run against the same base digest. Owner: Cloudron base image.
+    expiredAt: "2027-01-31"
+  - id: CVE-2026-74597
+    statement: >-
+      Inherited from cloudron/base:6.0.1. linux-libc-dev ships kernel UAPI headers only: no
+      kernel code from it is executed by this app, and the running kernel is the Cloudron
+      host's, which Cloudron patches. Ubuntu has published a fixed header package
+      (7.0.0-42.42), so this clears on the next cloudron/base rebuild. Advisory appeared after
+      0.2.0's first gate run against the same base digest. Owner: Cloudron base image.
+    expiredAt: "2027-01-31"
   - id: CVE-2025-68121
     statement: >-
       Inherited from cloudron/base:6.0.1. gosu is Cloudron's privilege-drop helper, executed
