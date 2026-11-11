@@ -19,7 +19,9 @@
 # problem (trivy could not run, no report produced). A missing report is never
 # treated as a pass.
 #
-set -euo pipefail
+set -Eeuo pipefail
+# Unexpected tooling/I/O errors are infrastructure failures, never finding exits.
+trap 'echo "error: security gate could not complete (line $LINENO)" >&2; exit 2' ERR
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -36,6 +38,7 @@ REPORTS_DIR="${REPORTS_DIR:-reports}"
 IGNORE_FILE="${IGNORE_FILE:-.trivyignore.yaml}"
 CACHE_DIR="${TRIVY_CACHE_DIR:-$HOME/.cache/trivy}"
 SCAN_MODE="${SCAN_MODE:-auto}"
+OFFLINE_SCAN="${OFFLINE_SCAN:-0}"
 # Pinned so a release is scanned by a known Trivy build; bump deliberately.
 TRIVY_IMAGE="${TRIVY_IMAGE:-docker.io/aquasec/trivy:0.76.1}"
 BASE_IMAGE="${BASE_IMAGE:-}"
@@ -53,13 +56,24 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+case "$GATE_MODE" in strict|new|none) ;; *) echo "error: invalid gate mode" >&2; exit 2 ;; esac
 [[ -n "$IMAGE" ]] || { echo "error: no image reference given" >&2; usage 2; }
+command -v bun >/dev/null || { echo "error: bun is required for report and acceptance validation" >&2; exit 2; }
 command -v jq >/dev/null || { echo "error: jq is required" >&2; exit 2; }
 
 mkdir -p "$CACHE_DIR" "$REPORTS_DIR"
-STAMP="$(date -u +%Y%m%d-%H%M%S)"
+STAMP="$(date -u +%Y%m%d-%H%M%S)-$$"
 SLUG="$(printf '%s' "$IMAGE" | tr '/:@' '___')"
-OUT_PREFIX="$REPORTS_DIR/trivy-$SLUG"
+RUN_DIR="$(mktemp -d "$REPORTS_DIR/run-$STAMP-XXXXXX")"
+OUT_PREFIX="$RUN_DIR/trivy-$SLUG"
+infra() { echo "error: $*" >&2; exit 2; }
+# Always write into a fresh directory; a previous run can never supply a report.
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"; rm -f "$OUT_PREFIX.tar" "$OUT_PREFIX.base.tar"' EXIT
+
+derive_report() {
+    bun scripts/lib/security-report.ts derive "$1" "$2" || infra "unusable Trivy report: $1"
+}
 SEVERITIES="CRITICAL${EXTRA_SEVERITIES:+,$EXTRA_SEVERITIES}"
 
 # ---------------------------------------------------------------- container runtime
@@ -104,6 +118,9 @@ if [[ ${#SOCK_VOL[@]} -eq 0 ]]; then
     "$RUNNER" save -o "$TAR_PATH" "$IMAGE" || { echo "error: $RUNNER save failed" >&2; exit 2; }
 fi
 
+OFFLINE_ARGS=()
+[[ "$OFFLINE_SCAN" == 1 ]] && OFFLINE_ARGS=(--skip-db-update --skip-java-db-update --offline-scan)
+
 IGNORE_ARGS=()
 if [[ -f "$IGNORE_FILE" ]]; then
     IGNORE_ARGS=(--ignorefile "/scan/$IGNORE_FILE")
@@ -123,14 +140,14 @@ trivy() {
         -v "$REPO_ROOT:/scan:ro" \
         -v "$REPO_ROOT/$REPORTS_DIR:/scan/$REPORTS_DIR" \
         -w /scan \
-        "$TRIVY_IMAGE" "$@" "${scan_args[@]}" "${IGNORE_ARGS[@]}"
+        "$TRIVY_IMAGE" "$@" "${scan_args[@]}" "${IGNORE_ARGS[@]}" "${OFFLINE_ARGS[@]}"
 }
 
 # ---------------------------------------------------------------- scan
 
 scan_image() {  # scan_image <image-or---input=PATH> <out.json> ; exit code preserved
     local target="$1" out="$2"
-    local args=(image --format json -o "/scan/${out#"$REPO_ROOT"/}")
+    local args=(image --show-suppressed --exit-code 0 --format json -o "/scan/${out#"$REPO_ROOT"/}")
     if [[ "$target" == --input=* ]]; then
         trivy "${args[@]}" --input "${target#--input=}"
     else
@@ -138,18 +155,16 @@ scan_image() {  # scan_image <image-or---input=PATH> <out.json> ; exit code pres
     fi
 }
 
-rc=0
+FULL_JSON="$OUT_PREFIX.full.json"
+GATE_JSON="$OUT_PREFIX.gate.json"
 if [[ ${#SOCK_VOL[@]} -eq 0 ]]; then
-    scan_image "--input=/scan/$OUT_PREFIX.tar" "$OUT_PREFIX.json" || rc=$?
+    scan_image "--input=/scan/$OUT_PREFIX.tar" "$FULL_JSON" || infra "image scan failed"
 else
-    scan_image "$IMAGE" "$OUT_PREFIX.json" || rc=$?
+    scan_image "$IMAGE" "$FULL_JSON" || infra "image scan failed"
 fi
-
-if [[ ! -s "$OUT_PREFIX.json" ]] || ! jq -e . "$OUT_PREFIX.json" >/dev/null 2>&1; then
-    echo "error: Trivy produced no usable report (exit $rc) — treating as gate failure to run" >&2
-    exit 2
-fi
-[[ "$rc" -ne 0 && "$rc" -ne 1 ]] && { echo "error: trivy exited $rc" >&2; exit 2; }
+derive_report "$FULL_JSON" "$GATE_JSON"
+# Keep the historical filename, now explicitly the suppression-aware full report.
+cp "$FULL_JSON" "$OUT_PREFIX.json"
 
 # ---------------------------------------------------------------- base-image diff
 
@@ -160,14 +175,14 @@ fi
 if [[ -n "$BASE_IMAGE" ]]; then
     BASE_JSON="$OUT_PREFIX.base.json"
     echo "==> Scanning base image for attribution: $BASE_IMAGE"
+    BASE_FULL_JSON="$OUT_PREFIX.base.full.json"
     if [[ ${#SOCK_VOL[@]} -eq 0 ]]; then
-        "$RUNNER" save -o "$OUT_PREFIX.base.tar" "$BASE_IMAGE" >/dev/null 2>&1 || true
-        scan_image "--input=/scan/$OUT_PREFIX.base.tar" "$BASE_JSON" >/dev/null 2>&1 || true
-        rm -f "$OUT_PREFIX.base.tar"
+        "$RUNNER" save -o "$OUT_PREFIX.base.tar" "$BASE_IMAGE" || infra "base image export failed"
+        scan_image "--input=/scan/$OUT_PREFIX.base.tar" "$BASE_FULL_JSON" || infra "base scan failed"
     else
-        scan_image "$BASE_IMAGE" "$BASE_JSON" >/dev/null 2>&1 || true
+        scan_image "$BASE_IMAGE" "$BASE_FULL_JSON" || infra "base scan failed"
     fi
-    jq -e . "$BASE_JSON" >/dev/null 2>&1 || BASE_JSON=""
+    derive_report "$BASE_FULL_JSON" "$BASE_JSON"
 fi
 
 # ---------------------------------------------------------------- dependency scan
@@ -175,8 +190,7 @@ fi
 DEPS_JSON=""
 if [[ "$SCAN_DEPS" == "1" ]]; then
     DEPS_JSON="$OUT_PREFIX.deps.json"
-    tmp="$(mktemp -d)"
-    trap 'rm -rf "$tmp"' EXIT
+    tmp="$TMP_DIR"
     cp package.json "$tmp"/
     if [[ -f bun.lock ]]; then
         cp bun.lock "$tmp"/
@@ -187,8 +201,7 @@ if [[ "$SCAN_DEPS" == "1" ]]; then
             || { echo "error: could not convert bun.lockb to bun.lock for scanning" >&2; exit 2; }
         rm -f "$tmp/bun.lockb"
     else
-        echo "warn: no bun lockfile found; dependency scan skipped" >&2
-        DEPS_JSON=""
+        infra "no usable bun lockfile found (use --no-deps only for an intentional partial scan)"
     fi
     if [[ -n "$DEPS_JSON" ]]; then
         echo "==> Scanning dependency lockfile (bun)"
@@ -199,32 +212,41 @@ if [[ "$SCAN_DEPS" == "1" ]]; then
             -v "$REPO_ROOT/$REPORTS_DIR:/scan/$REPORTS_DIR" \
             -v "$tmp:/deps:ro" \
             -w /scan \
-            "$TRIVY_IMAGE" fs --scanners vuln --format json \
-            --severity "$SEVERITIES" "${IGNORE_ARGS[@]}" \
-            -o "/scan/${DEPS_JSON#"$REPO_ROOT"/}" /deps >/dev/null 2>&1 || true
-        [[ -s "$DEPS_JSON" ]] || DEPS_JSON=""
+            "$TRIVY_IMAGE" fs --scanners vuln --show-suppressed --exit-code 0 --format json \
+            --severity "$SEVERITIES" "${IGNORE_ARGS[@]}" "${OFFLINE_ARGS[@]}" \
+            -o "/scan/${DEPS_JSON%.json}.full.json" /deps || infra "dependency scan failed"
+        derive_report "${DEPS_JSON%.json}.full.json" "$DEPS_JSON"
     fi
 fi
 
 # ---------------------------------------------------------------- report
 
-findings() { jq -r '[.Results[]?|.Vulnerabilities[]?]|length' "$1" 2>/dev/null || echo 0; }
+WARNING_REPORT="$OUT_PREFIX.warnings.txt"
+: > "$WARNING_REPORT"
+if [[ -f "$IGNORE_FILE" ]]; then
+    warning_inputs=("$FULL_JSON")
+    [[ -n "$DEPS_JSON" ]] && warning_inputs+=("${DEPS_JSON%.json}.full.json")
+    bun scripts/lib/security-report.ts warnings "$IGNORE_FILE" "${warning_inputs[@]}" > "$WARNING_REPORT" \
+        || infra "acceptance validation failed"
+fi
+
+findings() { jq -er '[.Results[]?|.Vulnerabilities[]?]|length' "$1" || infra "cannot count findings in $1"; }
 
 NEW_JSON="$OUT_PREFIX.new.json"
 if [[ -n "$BASE_JSON" ]]; then
     # A finding is "inherited" when the base image has a CRITICAL with the same
     # CVE in the same package. Everything else was introduced by our layers.
-    jq -n --slurpfile img "$OUT_PREFIX.json" --slurpfile base "$BASE_JSON" '
+    jq -n --slurpfile img "$GATE_JSON" --slurpfile base "$BASE_JSON" '
       [ ($base[0].Results[]? | .Vulnerabilities[]? | "\(.VulnerabilityID)\t\(.PkgName)") ] as $b
       | { Results: [ $img[0].Results[]? | { Target, Class, Type,
             Vulnerabilities: [ .Vulnerabilities[]?
               | select( ("\(.VulnerabilityID)\t\(.PkgName)") as $k | ($b | index($k)) == null ) ] }
           | select(.Vulnerabilities | length > 0) ] }' > "$NEW_JSON"
 else
-    cp "$OUT_PREFIX.json" "$NEW_JSON"
+    cp "$GATE_JSON" "$NEW_JSON"
 fi
 
-TOTAL="$(findings "$OUT_PREFIX.json")"
+TOTAL="$(findings "$GATE_JSON")"
 NEW="$(findings "$NEW_JSON")"
 DEPS=0
 [[ -n "$DEPS_JSON" ]] && DEPS="$(findings "$DEPS_JSON")"
@@ -252,8 +274,9 @@ render() {  # render <json> <label>
     echo "======================= security gate: $IMAGE"
     echo "trivy $TRIVY_IMAGE   severity=$SEVERITIES   gate=$GATE_MODE$([[ "$IGNORE_UNFIXED" == 1 ]] && echo '   (ignore-unfixed)')"
     [[ -f "$IGNORE_FILE" ]] && echo "accepted risks: $IGNORE_FILE"
+    echo "scope: severity=$SEVERITIES ignore-unfixed=$IGNORE_UNFIXED deps=$SCAN_DEPS; full means within this scope"
     echo
-    render "$OUT_PREFIX.json" "image"
+    render "$GATE_JSON" "image"
     if [[ -n "$BASE_JSON" ]]; then
         echo
         echo "base image: $BASE_IMAGE"
@@ -264,8 +287,15 @@ render() {  # render <json> <label>
         render "$DEPS_JSON" "deps"
     fi
     echo
-    printf 'critical findings — image: %s   introduced by this image: %s   deps: %s\n' "$TOTAL" "$NEW" "$DEPS"
-    echo "reports: $OUT_PREFIX.json${BASE_JSON:+ $BASE_JSON}${DEPS_JSON:+ $DEPS_JSON} $NEW_JSON"
+    accepted_inputs=("$FULL_JSON")
+    [[ -n "$DEPS_JSON" ]] && accepted_inputs+=("${DEPS_JSON%.json}.full.json")
+    echo "Accepted findings (image and dependency scans; statement is the owning rationale):"
+    jq -r '.Results[]? | . as $r | .ExperimentalModifiedFindings[]? |
+      ["accepted", $r.Target, .Finding.PkgName, .Finding.VulnerabilityID, .Statement] | @tsv' "${accepted_inputs[@]}"
+    ACCEPTED="$(jq -s '[.[].Results[]? | .ExperimentalModifiedFindings[]?] | length' "${accepted_inputs[@]}")"
+    printf 'findings (selected severities) — unaccepted image: %s   accepted (image + deps): %s   introduced: %s   unaccepted deps: %s\n' "$TOTAL" "$ACCEPTED" "$NEW" "$DEPS"
+    cat "$WARNING_REPORT"
+    echo "reports: $FULL_JSON $GATE_JSON${BASE_JSON:+ $BASE_JSON}${DEPS_JSON:+ $DEPS_JSON} $NEW_JSON (dependency/base *.full.json retain suppressions)"
 } | tee "$OUT_PREFIX.txt"
 
 gate_failed=0
@@ -294,7 +324,7 @@ expiry date, in $IGNORE_FILE. Triage checklist:
   3. Dependency finding        -> bump the dependency (deps are scanned from
                                  bun.lock; Trivy cannot read bun.lockb directly).
 
-Full report: $OUT_PREFIX.json
+Full report: $FULL_JSON
 EOF
     exit 1
 fi
