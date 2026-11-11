@@ -6,7 +6,10 @@ import { join, resolve } from "node:path";
 const finding = { VulnerabilityID: "CVE-A", PkgName: "pkg", InstalledVersion: "1", Severity: "CRITICAL" };
 const report = (v: any[] = [], m: any[] = []) => ({ SchemaVersion: 2, ArtifactName: "fixture", ArtifactType: "container_image", Results: [{ Target: "fixture", Vulnerabilities: v, ExperimentalModifiedFindings: m }] });
 
-function run(mode: string, failure = "", image = report(), base = report(), deps = report(), scanDeps = false) {
+const noResults = { SchemaVersion: 2, ArtifactName: "fixture", ArtifactType: "filesystem" };
+const ignoreYaml = 'vulnerabilities:\n  - id: CVE-A\n    statement: fixture rationale\n    expiredAt: "2027-01-31"\n';
+
+function run(mode: string, failure = "", image: any = report(), base: any = report(), deps: any = report(), scanDeps = false, ignore = ignoreYaml) {
   const root = mkdtempSync(join(tmpdir(), "security-scan-"));
   try {
     mkdirSync(join(root, "scripts/lib"), { recursive: true });
@@ -18,7 +21,7 @@ function run(mode: string, failure = "", image = report(), base = report(), deps
     writeFileSync(join(root, "reports/trivy-fixture-image.json"), JSON.stringify(report()));
     writeFileSync(join(root, "package.json"), "{}");
     writeFileSync(join(root, "bun.lock"), "{}");
-    writeFileSync(join(root, ".trivyignore.yaml"), 'vulnerabilities:\n  - id: CVE-A\n    statement: fixture rationale\n    expiredAt: "2027-01-31"\n');
+    writeFileSync(join(root, ".trivyignore.yaml"), ignore);
     for (const [key, value] of Object.entries({ image, base, deps })) writeFileSync(join(root, `${key}.json`), JSON.stringify(value));
     writeFileSync(join(root, "bin/podman"), `#!/usr/bin/env bash
 set -eu
@@ -62,12 +65,67 @@ test("strict/new/none preserve attribution and gate policy", () => {
   expect(run("strict").text).toContain("STALE ACCEPTANCE");
 });
 
-test("every mandatory scanner rejects failed, missing and malformed reports", () => {
-  for (const kind of ["image", "base", "deps"]) {
+test("image and deps scanner failures exit 2 in every mode", () => {
+  for (const kind of ["image", "deps"]) {
     for (const failure of ["failed", "missing", "malformed"]) {
-      const result = run("none", `${kind}-${failure}`, report(), report(), report(), true);
-      expect(result.code, `${kind}-${failure}: ${result.text}`).toBe(2);
-      expect(result.text).not.toContain("GATE PASSED");
+      for (const mode of ["strict", "new", "none"]) {
+        const result = run(mode, `${kind}-${failure}`, report(), report(), report(), true);
+        expect(result.code, `${mode} ${kind}-${failure}: ${result.text}`).toBe(2);
+        expect(result.text).not.toContain("GATE PASSED");
+      }
     }
   }
+});
+
+test("base attribution failure is fatal only under --gate new", () => {
+  for (const failure of ["failed", "missing", "malformed"]) {
+    const fatal = run("new", `base-${failure}`, report(), report(), report(), true);
+    expect(fatal.code, `new base-${failure}: ${fatal.text}`).toBe(2);
+    expect(fatal.text).not.toContain("GATE PASSED");
+    for (const mode of ["strict", "none"]) {
+      const result = run(mode, `base-${failure}`, report(), report(), report(), true);
+      expect(result.code, `${mode} base-${failure}: ${result.text}`).toBe(0);
+      expect(result.text).toContain("warn: base image attribution unavailable (");
+      expect(result.text).toContain("introduced count not computed");
+      expect(result.text).toContain("introduced: n/a");
+    }
+  }
+  // Without attribution, real findings still gate under strict and are not called "introduced".
+  const blocked = run("strict", "base-failed", report([finding]));
+  expect(blocked.code).toBe(1);
+  expect(blocked.text).toContain("introduced: n/a");
+  expect(run("none", "", report()).text).not.toContain("n/a");
+});
+
+test("a report without a Results key is a clean scan", () => {
+  const result = run("strict", "", noResults, noResults, noResults, true);
+  expect(result.code, result.text).toBe(0);
+  expect(result.text).toContain("GATE PASSED");
+  expect(result.text).toContain("introduced: 0");
+  expect(run("new", "", report(), report(), noResults, true).code).toBe(0);
+});
+
+test("bad acceptance file fails fast with a clear error before any scan", () => {
+  for (const bad of ['vulnerabilities:\n  - id: CVE-A\n    expiredAt: "2027-01-31"\n', 'vulnerabilities:\n  - id: CVE-A\n    statement: x\n    expiredAt: "2027-02-30"\n', "vulnerabilities: nope\n"]) {
+    const result = run("strict", "", report(), report(), report(), true, bad);
+    expect(result.code, result.text).toBe(2);
+    expect(result.text).toContain("invalid acceptance file");
+    expect(result.text).not.toContain("Scanning");
+    expect(result.text).not.toContain("exporting image");
+    expect(result.text).not.toContain("unknown suppression schema");
+  }
+});
+
+test("acceptance file without a vulnerabilities key is valid", () => {
+  for (const ignore of ["misconfigurations:\n  - id: AVD-1\n", "", "# nothing accepted\n"]) {
+    const result = run("strict", "", report(), report(), report(), true, ignore);
+    expect(result.code, result.text).toBe(0);
+    expect(result.text).toContain("GATE PASSED");
+  }
+});
+
+test("accepted finding without a Statement does not break report derivation", () => {
+  const result = run("strict", "", report([], [{ Type: "vulnerability", Status: "ignored", Finding: finding }]));
+  expect(result.code, result.text).toBe(0);
+  expect(result.text).toContain("accepted (image + deps): 1");
 });

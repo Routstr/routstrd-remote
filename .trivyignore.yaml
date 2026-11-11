@@ -1,14 +1,18 @@
 # .trivyignore.yaml — accepted-risk allowlist for the release security gate.
 #
 # scripts/security-scan.sh reads this file (via `trivy --ignorefile`) and fails
-# the release on any CRITICAL vulnerability that is NOT listed here. Anything
-# listed here is dropped from the report, so this file is the only way a
-# known-bad finding can ship — treat it like a signed exception list:
+# the release on any CRITICAL vulnerability that is NOT listed here. Listed
+# findings do not block the gate but stay visible: they appear in the full
+# report (`*.full.json`), the `SOURCE=accepted` table and the accepted count.
+# This file is the only way a known-bad finding can ship — treat it like a
+# signed exception list:
 #
 #   * every entry needs a `statement` (why it is not exploitable here, who owns
 #     the fix) and an `expiredAt` date, max 90 days out;
 #   * expired entries stop being honoured, so the gate starts failing again on
 #     its own — that is the point;
+#   * the gate warns 30 and 7 days before expiry, and flags STALE acceptances
+#     (ids no longer observed in the scans);
 #   * review it on every release with `git log -p .trivyignore.yaml`.
 #
 # Everything below is inherited from cloudron/base:6.0.1; the gate reports

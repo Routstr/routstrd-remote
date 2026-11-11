@@ -61,6 +61,12 @@ case "$GATE_MODE" in strict|new|none) ;; *) echo "error: invalid gate mode" >&2;
 command -v bun >/dev/null || { echo "error: bun is required for report and acceptance validation" >&2; exit 2; }
 command -v jq >/dev/null || { echo "error: jq is required" >&2; exit 2; }
 
+# Fail fast on a bad acceptance file, before any image export or scan.
+if [[ -f "$IGNORE_FILE" ]]; then
+    bun scripts/lib/security-report.ts validate-ignore "$IGNORE_FILE" \
+        || { echo "error: invalid acceptance file: $IGNORE_FILE" >&2; exit 2; }
+fi
+
 mkdir -p "$CACHE_DIR" "$REPORTS_DIR"
 STAMP="$(date -u +%Y%m%d-%H%M%S)-$$"
 SLUG="$(printf '%s' "$IMAGE" | tr '/:@' '___')"
@@ -169,20 +175,35 @@ cp "$FULL_JSON" "$OUT_PREFIX.json"
 # ---------------------------------------------------------------- base-image diff
 
 BASE_JSON=""
+BASE_UNAVAILABLE=0
 if [[ -z "$BASE_IMAGE" && -f Dockerfile ]]; then
     BASE_IMAGE="$(awk 'toupper($1)=="FROM"{print $2; exit}' Dockerfile | sed 's/^--platform=[^ ]* //')"
 fi
-if [[ -n "$BASE_IMAGE" ]]; then
-    BASE_JSON="$OUT_PREFIX.base.json"
-    echo "==> Scanning base image for attribution: $BASE_IMAGE"
-    BASE_FULL_JSON="$OUT_PREFIX.base.full.json"
+
+# Runs under `if`, so errexit/ERR are suppressed: every step reports via BASE_ERR.
+base_attribution() {
+    local full="$OUT_PREFIX.base.full.json"
     if [[ ${#SOCK_VOL[@]} -eq 0 ]]; then
-        "$RUNNER" save -o "$OUT_PREFIX.base.tar" "$BASE_IMAGE" || infra "base image export failed"
-        scan_image "--input=/scan/$OUT_PREFIX.base.tar" "$BASE_FULL_JSON" || infra "base scan failed"
+        "$RUNNER" save -o "$OUT_PREFIX.base.tar" "$BASE_IMAGE" || { BASE_ERR="base image export failed"; return 1; }
+        scan_image "--input=/scan/$OUT_PREFIX.base.tar" "$full" || { BASE_ERR="base scan failed"; return 1; }
     else
-        scan_image "$BASE_IMAGE" "$BASE_FULL_JSON" || infra "base scan failed"
+        scan_image "$BASE_IMAGE" "$full" || { BASE_ERR="base scan failed"; return 1; }
     fi
-    derive_report "$BASE_FULL_JSON" "$BASE_JSON"
+    bun scripts/lib/security-report.ts derive "$full" "$OUT_PREFIX.base.json" || { BASE_ERR="unusable Trivy report: $full"; return 1; }
+}
+
+if [[ -n "$BASE_IMAGE" ]]; then
+    echo "==> Scanning base image for attribution: $BASE_IMAGE"
+    BASE_ERR=""
+    if base_attribution; then
+        BASE_JSON="$OUT_PREFIX.base.json"
+    elif [[ "$GATE_MODE" == "new" ]]; then
+        infra "$BASE_ERR"   # attribution is the gate in this mode
+    else
+        echo "warn: base image attribution unavailable ($BASE_ERR); introduced count not computed" >&2
+        BASE_UNAVAILABLE=1
+        rm -f "$OUT_PREFIX.base.json" "$OUT_PREFIX.base.full.json"
+    fi
 fi
 
 # ---------------------------------------------------------------- dependency scan
@@ -248,6 +269,8 @@ fi
 
 TOTAL="$(findings "$GATE_JSON")"
 NEW="$(findings "$NEW_JSON")"
+NEW_LABEL="$NEW"
+[[ "$BASE_UNAVAILABLE" == 1 ]] && NEW_LABEL="n/a"
 DEPS=0
 [[ -n "$DEPS_JSON" ]] && DEPS="$(findings "$DEPS_JSON")"
 
@@ -293,7 +316,7 @@ render() {  # render <json> <label>
     jq -r '.Results[]? | . as $r | .ExperimentalModifiedFindings[]? |
       ["accepted", $r.Target, .Finding.PkgName, .Finding.VulnerabilityID, .Statement] | @tsv' "${accepted_inputs[@]}"
     ACCEPTED="$(jq -s '[.[].Results[]? | .ExperimentalModifiedFindings[]?] | length' "${accepted_inputs[@]}")"
-    printf 'findings (selected severities) — unaccepted image: %s   accepted (image + deps): %s   introduced: %s   unaccepted deps: %s\n' "$TOTAL" "$ACCEPTED" "$NEW" "$DEPS"
+    printf 'findings (selected severities) — unaccepted image: %s   accepted (image + deps): %s   introduced: %s   unaccepted deps: %s\n' "$TOTAL" "$ACCEPTED" "$NEW_LABEL" "$DEPS"
     cat "$WARNING_REPORT"
     echo "reports: $FULL_JSON $GATE_JSON${BASE_JSON:+ $BASE_JSON}${DEPS_JSON:+ $DEPS_JSON} $NEW_JSON (dependency/base *.full.json retain suppressions)"
 } | tee "$OUT_PREFIX.txt"
@@ -307,13 +330,10 @@ case "$GATE_MODE" in
 esac
 [[ "$DEPS" -gt 0 ]] && gate_failed=1
 
-# Clean up the exported tarball, if any.
-rm -f "$OUT_PREFIX.tar"
-
 if [[ "$gate_failed" -eq 1 ]]; then
     cat <<EOF
 
-RELEASE BLOCKED — $TOTAL critical finding(s) in the image ($NEW not explained by the
+RELEASE BLOCKED — $TOTAL critical finding(s) in the image ($NEW_LABEL not explained by the
 base image), $DEPS in dependency lockfile.
 
 Each one must either be fixed or explicitly accepted, with a justification and an
