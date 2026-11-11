@@ -14,14 +14,16 @@ real 0.1.29 release), including the traps that cost time.
 | GitHub repo | `Routstr/routstrd-remote` (**renamed** from `Routstr/routstrd-auth`) |
 | GHCR image | `ghcr.io/sh1ftred/routstrd-pro` |
 | Cloudron app id | `io.routstr.routstrd-auth` |
-| Branch the instance pulls from | `cloudron` (via the raw `CloudronVersions.json` URL) |
-| Release catalog | `CloudronVersions.json` (repo root) |
+| Branch the instance pulls from | `cloudron` (the catalog is mirrored from it — see below) |
+| Release catalog | `CloudronVersions.json` (repo root), mirrored to `routstr.com` |
+| Catalog URL the app uses | `https://routstr.com/CloudronVersions.json` (Vercel, from `landingpage/public/`) |
 
-**Publishing a version requires four things:** an image pushed to a registry, that
+**Publishing a version requires five things:** an image pushed to a registry, that
 image passing the Trivy security gate (section 7), a new entry in
-`CloudronVersions.json`, and that file pushed to the `cloudron` branch. There is no
-CI that does any of this — it is all manual from a workstation, which is why the
-gate is a script that `scripts/publish-image.sh` always runs before pushing.
+`CloudronVersions.json`, that file pushed to the `cloudron` branch, and the same
+file mirrored to `routstr.com` (step 9b) — which is the URL the app is actually
+pointed at. There is no CI that does any of this — it is all manual from a
+workstation, which is why the gate and the mirror are scripts that fail loudly.
 
 ### The image name is not the repo name
 
@@ -255,15 +257,50 @@ Local `cloudron` is often stale/divergent — reset it to `origin/cloudron` befo
 merging, and confirm the reset discards nothing (`git rev-list --left-right --count
 cloudron...origin/cloudron` should show `0 <n>`, i.e. no local-only commits).
 
-### Step 10 — Verify live
+### Step 9b — Mirror the catalog to routstr.com (not GitHub)
 
-```bash
-curl -s "https://raw.githubusercontent.com/Routstr/routstrd-remote/refs/heads/cloudron/CloudronVersions.json" \
-  | jq -r '.versions["0.1.29"] | {v: .manifest.version, img: .manifest.dockerImage, state: .publishState}'
+The catalog the app is pointed at is served from Vercel, not from GitHub:
+
+```
+https://routstr.com/CloudronVersions.json
 ```
 
-The old `routstrd-auth` slug also still serves the file via GitHub's rename
-redirect, so either URL works.
+That is a copy in the `landingpage` repo (`public/CloudronVersions.json`), so it
+does not update itself. After the registration is committed and pushed, run:
+
+```bash
+./scripts/publish-catalog.sh
+```
+
+It copies `CloudronVersions.json` over the landingpage copy, refuses to write a
+catalog that is not valid JSON or has no versions, prints the diff, commits only
+that one file, and pushes — which triggers the Vercel deploy. Use `--dry-run` to
+stop before committing, and `--check` (exit 1 when stale) to confirm they match
+without writing anything.
+
+**Why a copy instead of a build-time fetch:** a fetch that fails open during a
+`next build` would silently serve the *previous* catalog, which looks like a
+successful release that nobody receives. An explicit step fails loudly instead.
+
+This step is required — a release registered only on the `cloudron` branch is not
+visible to anyone whose `versionsUrl` points at routstr.com.
+
+### Step 10 — Verify live
+
+Verify the URL the app actually uses, and cross-check the branch copy:
+
+```bash
+# what instances read
+curl -s https://routstr.com/CloudronVersions.json \
+  | jq -r '.versions["0.1.29"] | {v: .manifest.version, img: .manifest.dockerImage, state: .publishState}'
+
+# must match the branch copy (exit 1 if the mirror is stale)
+./scripts/publish-catalog.sh --check
+```
+
+Note that `routstr.com/CloudronVersions.json` was stale at 0.1.1 until 0.2.0 —
+if it ever disagrees with the branch, the mirror step was skipped, and users are
+being offered an old version.
 
 ### Step 11 — Update the running instance (optional, operator decision)
 
