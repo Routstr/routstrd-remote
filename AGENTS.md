@@ -14,14 +14,16 @@ real 0.1.29 release), including the traps that cost time.
 | GitHub repo | `Routstr/routstrd-remote` (**renamed** from `Routstr/routstrd-auth`) |
 | GHCR image | `ghcr.io/sh1ftred/routstrd-pro` |
 | Cloudron app id | `io.routstr.routstrd-auth` |
-| Branch the instance pulls from | `cloudron` (via the raw `CloudronVersions.json` URL) |
-| Release catalog | `CloudronVersions.json` (repo root) |
+| Branch the instance pulls from | `cloudron` (the catalog is mirrored from it — see below) |
+| Release catalog | `CloudronVersions.json` (repo root), mirrored to `routstr.com` |
+| Catalog URL the app uses | `https://routstr.com/CloudronVersions.json` (Vercel, from `landingpage/public/`) |
 
-**Publishing a version requires four things:** an image pushed to a registry, that
+**Publishing a version requires five things:** an image pushed to a registry, that
 image passing the Trivy security gate (section 7), a new entry in
-`CloudronVersions.json`, and that file pushed to the `cloudron` branch. There is no
-CI that does any of this — it is all manual from a workstation, which is why the
-gate is a script that `scripts/publish-image.sh` always runs before pushing.
+`CloudronVersions.json`, that file pushed to the `cloudron` branch, and the same
+file mirrored to `routstr.com` (step 9b) — which is the URL the app is actually
+pointed at. There is no CI that does any of this — it is all manual from a
+workstation, which is why the gate and the mirror are scripts that fail loudly.
 
 ### The image name is not the repo name
 
@@ -59,8 +61,9 @@ podman login ghcr.io -u <user>   # token needs write:packages
   public — verify with an anonymous pull (step 6 below).
 - **Trivy needs no install.** The release security gate (step 5b) runs Trivy from
   `docker.io/aquasec/trivy:0.76.1` via the same podman socket, caching its
-  vulnerability DB in `~/.cache/trivy`. `jq` must be on PATH; nothing is added to
-  the release image.
+  vulnerability DB in `~/.cache/trivy`. `jq` and Bun (with `Bun.YAML`, verified 1.4.4) must be on PATH; nothing is added to
+  the release image. `bun test` needs `jq` too: `tests/security-scan.test.ts` runs the
+  real gate script against a podman stub.
 
 ### Two ways to build; only one is available here
 
@@ -242,7 +245,7 @@ git push origin main
 git fetch origin
 git checkout -B cloudron origin/cloudron   # reset: cloudron routinely drifts behind
 git merge main --no-edit
-bun test                                   # 50 pass on 0.1.29
+bun test                                   # 50 pass on 0.1.29; needs jq on PATH
 cloudron versions verify
 git push origin cloudron
 ```
@@ -255,15 +258,50 @@ Local `cloudron` is often stale/divergent — reset it to `origin/cloudron` befo
 merging, and confirm the reset discards nothing (`git rev-list --left-right --count
 cloudron...origin/cloudron` should show `0 <n>`, i.e. no local-only commits).
 
-### Step 10 — Verify live
+### Step 9b — Mirror the catalog to routstr.com (not GitHub)
 
-```bash
-curl -s "https://raw.githubusercontent.com/Routstr/routstrd-remote/refs/heads/cloudron/CloudronVersions.json" \
-  | jq -r '.versions["0.1.29"] | {v: .manifest.version, img: .manifest.dockerImage, state: .publishState}'
+The catalog the app is pointed at is served from Vercel, not from GitHub:
+
+```
+https://routstr.com/CloudronVersions.json
 ```
 
-The old `routstrd-auth` slug also still serves the file via GitHub's rename
-redirect, so either URL works.
+That is a copy in the `landingpage` repo (`public/CloudronVersions.json`), so it
+does not update itself. After the registration is committed and pushed, run:
+
+```bash
+./scripts/publish-catalog.sh
+```
+
+It copies `CloudronVersions.json` over the landingpage copy, refuses to write a
+catalog that is not valid JSON or has no versions, prints the diff, commits only
+that one file, and pushes — which triggers the Vercel deploy. Use `--dry-run` to
+stop before committing, and `--check` (exit 1 when stale) to confirm they match
+without writing anything.
+
+**Why a copy instead of a build-time fetch:** a fetch that fails open during a
+`next build` would silently serve the *previous* catalog, which looks like a
+successful release that nobody receives. An explicit step fails loudly instead.
+
+This step is required — a release registered only on the `cloudron` branch is not
+visible to anyone whose `versionsUrl` points at routstr.com.
+
+### Step 10 — Verify live
+
+Verify the URL the app actually uses, and cross-check the branch copy:
+
+```bash
+# what instances read
+curl -s https://routstr.com/CloudronVersions.json \
+  | jq -r '.versions["0.1.29"] | {v: .manifest.version, img: .manifest.dockerImage, state: .publishState}'
+
+# must match the branch copy (exit 1 if the mirror is stale)
+./scripts/publish-catalog.sh --check
+```
+
+Note that `routstr.com/CloudronVersions.json` was stale at 0.1.1 until 0.2.0 —
+if it ever disagrees with the branch, the mirror step was skipped, and users are
+being offered an old version.
 
 ### Step 11 — Update the running instance (optional, operator decision)
 
@@ -330,8 +368,35 @@ What it does:
 | deps | `bun.lock` of this repo | Trivy cannot read the binary `bun.lockb`; the script converts a throwaway copy |
 
 Exit codes: `0` pass, `1` blocked, `2` could not run. A missing/invalid report is
-never treated as a pass. Reports land in `reports/` (gitignored): `*.json` (full),
-`*.base.json`, `*.new.json` (findings our layers introduced), `*.deps.json`, `*.txt`.
+never treated as a pass. The image scan and enabled lockfile scans are mandatory:
+scanner errors, missing lockfiles or unusable reports return `2`, even with
+`--gate none`. `--no-deps` deliberately omits the lockfile scan. A report with no
+`Results` key (Trivy found nothing to scan) is valid, not an error.
+
+Base-image attribution failures depend on the gate mode: with `--gate new` the
+attribution *is* the gate, so a failed base scan returns `2`. With `--gate strict`
+(default) or `none` it is only a warning (`warn: base image attribution unavailable …`)
+and the summary shows `introduced: n/a`.
+
+Reports land in a fresh `reports/run-*/` directory (gitignored) on every invocation:
+`*.full.json` and its historical `*.json` alias retain suppressed findings;
+`*.gate.json` contains only unaccepted image findings; `*.base.full.json` and
+`*.deps.full.json` retain suppressions in those scans; `*.base.json` and `*.deps.json`
+are their filtered counterparts; `*.new.json` contains unaccepted findings our
+layers introduced; `*.txt` is the summary and `*.warnings.txt` acceptance warnings.
+
+`reports/run-*/` directories accumulate one per invocation and are never pruned
+automatically. Prune old ones with:
+`find reports -maxdepth 1 -name 'run-*' -mtime +30 -exec rm -rf {} +`
+
+One Trivy `--show-suppressed` scan produces both full and gate reports per target.
+With pinned Trivy 0.76.1, `Vulnerabilities` contains unaccepted findings and
+`ExperimentalModifiedFindings` contains ignored findings plus statements. The helper
+validates that schema before deriving gate reports; no second image scan or DB
+snapshot is involved. “Full” means within the selected severities/filters, not every
+vulnerability. `EXTRA_SEVERITIES` extends the blocking severity selection, as before.
+`OFFLINE_SCAN=1` uses cached advisory databases with offline scanning; use it for
+repeatable local checks, not as a substitute for up-to-date release advisories.
 
 Gate modes:
 
@@ -346,6 +411,16 @@ Anything CRITICAL that ships must be listed there with a `statement` (why it is 
 exploitable here, who owns the fix) and an `expiredAt` date, max 90 days out.
 Expired entries stop being honoured, so the gate re-opens by itself. Never delete
 entries silently — replace or extend with a new justification.
+The ignorefile is validated up front, before any scan: every `vulnerabilities` entry
+needs an `id`, a non-empty `statement` and a real `YYYY-MM-DD` `expiredAt`, otherwise
+the script exits `2` immediately. A file without a `vulnerabilities:` key is valid.
+The summary warns at 30 and 7 days before expiry, and separately for expired entries
+(expiry at UTC midnight, matching Trivy). It never renews acceptances automatically.
+A `STALE ACCEPTANCE` warning means the ID was not observed in the completed image
+and enabled dependency scans, including suppressions. It is warning-only: severity,
+`--ignore-unfixed`, package/path scope, or skipped dependencies can explain absence.
+Review the scope and entry restrictions before removing it; absence is not proof of
+a fix. Base-only observations do not prove a finding remains in the shipped image.
 
 ### Reading the report
 
@@ -357,7 +432,11 @@ image    tar             6.2.1       7.5.19   fixed    CVE-2026-59873
 
 - `SOURCE=base` rows are inherited from `cloudron/base` — fix by bumping the base
   image, not by patching this Dockerfile.
-- `SOURCE=image` rows mean **our** layers added them: fix here (pin/bump).
+- `SOURCE=image` rows are all unaccepted image findings, including inherited ones;
+  `*.new.json` identifies those our layers introduced.
+- `SOURCE=accepted` rows include target, package, CVE and the acceptance statement.
+  Accepted counts cover image + enabled dependency scans (not the base, and not
+  deduplicated across targets); unaccepted image/dependency counts are separate.
 - `STATUS=fixed` means an upgrade exists; `affected` means no fix has shipped yet
   (candidate for `.trivyignore.yaml` with an expiry).
 
@@ -370,6 +449,16 @@ remaining base-image findings with short expiries.
 
 Bumping the base image is a real release (new Debian/Ubuntu base, new package set):
 treat it as its own versioned release and re-run the gate before and after.
+The Dockerfile pins a digest: an upstream tag rebuild alone changes nothing here;
+explicitly adopt the fixed digest, rebuild and verify the image.
+
+The image also purges the inherited build toolchain (`build-essential`, `gcc*`,
+`g++`, `cpp*`, `binutils`, `make`, `libc6-dev`, `linux-libc-dev`) after both Bun
+installs, which is what retires the `linux-libc-dev` acceptances. The purge list names
+versioned packages (`gcc-15`, `cpp-15`), so a base bump that changes the toolchain
+version fails the build on an unknown package — update the list, re-run the gate, and
+check that the removed `*-dev` packages were not providing a runtime `.so` shim
+(`@libsql`'s musl build loses `libc.so` this way and is never loaded on this image).
 
 ## 8. Conventions
 

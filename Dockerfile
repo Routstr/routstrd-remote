@@ -48,6 +48,21 @@ COPY package.json bun.lockb ./
 RUN bun install --frozen-lockfile --production
 COPY src ./src
 
+# Dependency installation may need native build tools; runtime uses prebuilt Bun
+# and routstrd. Remove the inherited compilers AND their versioned implementations
+# (purging only gcc/g++ leaves gcc-15 installed). Keep runtime libraries: do not
+# autoremove the base image's automatically installed packages here.
+RUN apt-get purge -y \
+        build-essential gcc gcc-15 gcc-15-x86-64-linux-gnu gcc-x86-64-linux-gnu \
+        g++ cpp cpp-15 cpp-15-x86-64-linux-gnu cpp-x86-64-linux-gnu \
+        binutils binutils-x86-64-linux-gnu make libc6-dev linux-libc-dev \
+    && apt-get check \
+    && test -z "$(dpkg --audit)" \
+    && test ! -e /usr/include/linux \
+    && for tool in cc gcc gcc-15 g++ g++-15 cpp cpp-15 as ld make; do \
+        if command -v "$tool"; then echo "Unexpected build tool: $tool" >&2; exit 1; fi; \
+    done
+
 # Supervisor manages both long-running processes in the single Cloudron app
 # container: routstrd on localhost:8009 and routstrd-auth on 0.0.0.0:8008.
 COPY cloudron/supervisord.conf /etc/supervisor/supervisord-cloudron.conf
