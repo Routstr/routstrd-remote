@@ -452,6 +452,14 @@ treat it as its own versioned release and re-run the gate before and after.
 The Dockerfile pins a digest: an upstream tag rebuild alone changes nothing here;
 explicitly adopt the fixed digest, rebuild and verify the image.
 
+The image also purges the inherited build toolchain (`build-essential`, `gcc*`,
+`g++`, `cpp*`, `binutils`, `make`, `libc6-dev`, `linux-libc-dev`) after both Bun
+installs, which is what retires the `linux-libc-dev` acceptances. The purge list names
+versioned packages (`gcc-15`, `cpp-15`), so a base bump that changes the toolchain
+version fails the build on an unknown package — update the list, re-run the gate, and
+check that the removed `*-dev` packages were not providing a runtime `.so` shim
+(`@libsql`'s musl build loses `libc.so` this way and is never loaded on this image).
+
 ## 8. Conventions
 
 - One writer per checkout; isolate concurrent work in `.worktrees/` (already in
