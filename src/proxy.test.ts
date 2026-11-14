@@ -6,6 +6,7 @@ import { tmpdir } from "os";
 import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools";
 import { AuthProxy, type AuthProxyConfig } from "./proxy";
 import { AuthStore } from "./store";
+import { resetNip98ReplayCache } from "./nip98";
 
 /**
  * Tests for model allowlist enforcement (AUTH-001).
@@ -524,6 +525,8 @@ describe("npub name endpoints", () => {
     const pubkey = getPublicKey(secretKey);
     const store = new AuthStore(tmp.dbPath);
     store.addNpub(pubkey, "admin", null, "Alice");
+    // A second admin, because demoting the only one is refused (last_admin).
+    store.addNpub("ab".repeat(32), "admin", null, "Second");
     store.close();
 
     proxy.close();
@@ -1347,6 +1350,112 @@ describe("daemon route capability boundary", () => {
 
     expect(res.status).toBe(400);
     expect(upstream.calls).toHaveLength(0);
+  });
+});
+
+describe("NIP-98 replay", () => {
+  let tmp: { dbPath: string; cleanup: () => void };
+  let proxy: AuthProxy;
+
+  beforeEach(() => {
+    resetNip98ReplayCache();
+    tmp = createTmpDb();
+  });
+
+  afterEach(() => {
+    proxy?.close();
+    tmp.cleanup();
+  });
+
+  it("refuses an event that was already used", async () => {
+    const secretKey = generateSecretKey();
+    const store = new AuthStore(tmp.dbPath);
+    store.addNpub(getPublicKey(secretKey), "admin", null, "Alice");
+    store.close();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    const req = new Request("http://localhost:8008/npubs");
+    const token = await nip98Authorization(secretKey, req);
+    const headers: Record<string, string> = { Authorization: token };
+
+    const first = await proxy.handle(new Request(req.url, { headers }));
+    expect(first.status).toBe(200);
+
+    // Same signed event, presented again inside the freshness window.
+    const second = await proxy.handle(new Request(req.url, { headers }));
+    expect(second.status).toBe(401);
+    expect((await second.json()).error).toContain("already been used");
+  });
+});
+
+describe("last admin guard", () => {
+  let tmp: { dbPath: string; cleanup: () => void };
+  let proxy: AuthProxy;
+  let secretKey: Uint8Array;
+  let pubkey: string;
+  let npub: string;
+
+  beforeEach(() => {
+    resetNip98ReplayCache();
+    tmp = createTmpDb();
+    secretKey = generateSecretKey();
+    pubkey = getPublicKey(secretKey);
+    const store = new AuthStore(tmp.dbPath);
+    npub = store.addNpub(pubkey, "admin", null, "Alice").npub;
+    store.close();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+  });
+
+  afterEach(() => {
+    proxy?.close();
+    tmp.cleanup();
+  });
+
+  async function call(method: string, path: string, payload?: Uint8Array): Promise<Response> {
+    const url = `http://localhost:8008${path}`;
+    const signed = new Request(url, { method, body: payload });
+    const token = await nip98Authorization(secretKey, signed, payload);
+    const headers: Record<string, string> = { Authorization: token };
+    return proxy.handle(new Request(url, { method, headers, body: payload }));
+  }
+
+  it("refuses to remove the only admin", async () => {
+    const res = await call("DELETE", `/npubs/${npub}`);
+    expect(res.status).toBe(409);
+    expect((await res.json()).code).toBe("last_admin");
+
+    const store = new AuthStore(tmp.dbPath);
+    expect(store.countNpubs("admin")).toBe(1);
+    store.close();
+  });
+
+  it("refuses to demote the only admin", async () => {
+    const payload = new TextEncoder().encode(
+      JSON.stringify({ pubkey, role: "user", name: "Alice" }),
+    );
+    const res = await call("PATCH", "/npubs", payload);
+    expect(res.status).toBe(409);
+    expect((await res.json()).code).toBe("last_admin");
+  });
+
+  it("allows removing an admin once another one exists", async () => {
+    const store = new AuthStore(tmp.dbPath);
+    const other = store.addNpub("ab".repeat(32), "admin", null, "Second");
+    store.close();
+
+    const res = await call("DELETE", `/npubs/${other.npub}`);
+    expect(res.status).toBe(200);
+    expect((await res.json()).removed).toBe(true);
+  });
+
+  it("still allows removing a non-admin", async () => {
+    const store = new AuthStore(tmp.dbPath);
+    const member = store.addNpub("cd".repeat(32), "user", null, "Member");
+    store.close();
+
+    const res = await call("DELETE", `/npubs/${member.npub}`);
+    expect(res.status).toBe(200);
+    expect((await res.json()).removed).toBe(true);
   });
 });
 

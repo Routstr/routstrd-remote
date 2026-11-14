@@ -743,6 +743,19 @@ export class AuthProxy {
         return this.json({ error: "Provide the npub/pubkey to remove in /npubs/<npub>, ?npub=..., or the JSON body." }, 400);
       }
 
+      const target = this.store.getNpubByPubkey(pubkey);
+      if (!target) return this.json({ removed: false });
+
+      // Emptying the admin list is not a normal state: nobody can add an npub,
+      // and an empty table is also the state that allows first-admin bootstrap.
+      if (target.role === "admin" && this.store.countNpubs("admin") <= 1) {
+        return this.json({
+          error:
+            "Refusing to remove the last admin. Add another admin first, then remove this one.",
+          code: "last_admin",
+        }, 409);
+      }
+
       const removed = this.store.removeNpub(pubkey);
       return this.json({ removed });
     }
@@ -769,6 +782,18 @@ export class AuthProxy {
           error:
             "Missing required field. Provide 'role', 'name', and/or 'monthlyLimitSats' to update.",
         }, 400);
+      }
+
+      // Demoting the last admin is the same lockout as deleting it.
+      if (parsed.role === "user") {
+        const current = this.store.getNpubByPubkey(parsed.pubkey);
+        if (current?.role === "admin" && this.store.countNpubs("admin") <= 1) {
+          return this.json({
+            error:
+              "Refusing to demote the last admin. Promote another npub to admin first.",
+            code: "last_admin",
+          }, 409);
+        }
       }
 
       const updated = this.store.updateNpub(parsed.pubkey, {

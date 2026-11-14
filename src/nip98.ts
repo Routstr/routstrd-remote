@@ -140,7 +140,38 @@ export async function validateNIP98Request(
     throw new Error("Invalid NIP-98 event signature.");
   }
 
+  // The signature alone does not stop a captured request being replayed inside
+  // the freshness window. Record the id for as long as an event could still be
+  // accepted, and refuse a second presentation of it.
+  const nowSeconds = Math.round(Date.now() / 1000);
+  if (seenEvents.has(event.id)) {
+    throw new Error("NIP-98 event has already been used.");
+  }
+  if (seenEvents.size >= SEEN_EVENTS_MAX) pruneSeenEvents(nowSeconds);
+  seenEvents.set(event.id, nowSeconds + SEEN_EVENTS_TTL_SECONDS);
+
   return { pubkey: event.pubkey, event };
+}
+
+/**
+ * Event ids accepted recently, mapped to the second they stop mattering.
+ * A NIP-98 event is only valid for `NIP98_MAX_AGE_SECONDS` either side of
+ * `created_at`, so anything older than that plus the window cannot be replayed
+ * anyway and the entry can go.
+ */
+const seenEvents = new Map<string, number>();
+const SEEN_EVENTS_TTL_SECONDS = NIP98_MAX_AGE_SECONDS * 2 + 5;
+const SEEN_EVENTS_MAX = 4096;
+
+function pruneSeenEvents(nowSeconds: number): void {
+  for (const [id, expiresAt] of seenEvents) {
+    if (expiresAt <= nowSeconds) seenEvents.delete(id);
+  }
+}
+
+/** Test hook: forget every recorded event id. */
+export function resetNip98ReplayCache(): void {
+  seenEvents.clear();
 }
 
 export function isNIP98Authorization(authorization: string | null): boolean {
