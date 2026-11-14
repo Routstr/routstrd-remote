@@ -1350,6 +1350,115 @@ describe("daemon route capability boundary", () => {
   });
 });
 
+describe("revocation when an npub is removed", () => {
+  let tmp: { dbPath: string; cleanup: () => void };
+  let upstream: ReturnType<typeof mockFetchUpstream>;
+  let proxy: AuthProxy;
+
+  beforeEach(() => {
+    tmp = createTmpDb();
+    upstream = mockFetchUpstream();
+  });
+
+  afterEach(() => {
+    proxy?.close();
+    upstream.restore();
+    tmp.cleanup();
+  });
+
+  function registerOwner(name = "Alice"): { pubkey: string; npub: string } {
+    const store = new AuthStore(tmp.dbPath);
+    const entry = store.addNpub("cd".repeat(32), "user", null, name);
+    store.close();
+    return { pubkey: entry.pubkey, npub: entry.npub };
+  }
+
+  function inference(apiKey: string): Promise<Response> {
+    proxy?.close();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+    return proxy.handle(
+      new Request("http://localhost:8008/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ model: "routstr/gpt-4o", messages: [] }),
+      }),
+    );
+  }
+
+  it("refuses a client whose owner npub was removed", async () => {
+    const owner = registerOwner();
+    setClients(tmp.dbPath, [
+      {
+        clientId: "laptop",
+        name: "Laptop",
+        apiKey: "sk-owned-by-alice",
+        createdAt: 0,
+        lastUsed: null,
+        ownerNpub: owner.npub,
+      },
+    ]);
+
+    const before = await inference("sk-owned-by-alice");
+    expect(before.status).toBe(200);
+
+    const store = new AuthStore(tmp.dbPath);
+    store.removeNpub(owner.pubkey);
+    store.close();
+
+    // The key is still in the daemon's storage; the proxy is what stops it.
+    const after = await inference("sk-owned-by-alice");
+    expect(after.status).toBe(403);
+    expect((await after.json()).code).toBe("client_owner_not_registered");
+    expect(upstream.calls).toHaveLength(1);
+  });
+
+  it("keeps working when the npub is registered again", async () => {
+    const owner = registerOwner();
+    setClients(tmp.dbPath, [
+      {
+        clientId: "laptop",
+        name: "Laptop",
+        apiKey: "sk-owned-by-alice",
+        createdAt: 0,
+        lastUsed: null,
+        ownerNpub: owner.npub,
+      },
+    ]);
+
+    const store = new AuthStore(tmp.dbPath);
+    store.removeNpub(owner.pubkey);
+    store.close();
+    expect((await inference("sk-owned-by-alice")).status).toBe(403);
+
+    const again = new AuthStore(tmp.dbPath);
+    again.addNpub(owner.pubkey, "user", null, "Alice");
+    again.close();
+
+    expect((await inference("sk-owned-by-alice")).status).toBe(200);
+  });
+
+  it("still serves a legacy client that records no owner", async () => {
+    // Clients created before `ownerNpub` existed have only the id suffix to go
+    // on, so they stay usable; this is the documented gap, pinned here so a
+    // future change to it is deliberate.
+    registerOwner();
+    setClients(tmp.dbPath, [
+      {
+        clientId: "legacy-box",
+        name: "Legacy",
+        apiKey: "sk-legacy",
+        createdAt: 0,
+        lastUsed: null,
+      },
+    ]);
+
+    expect((await inference("sk-legacy")).status).toBe(200);
+  });
+});
+
 describe("Monthly spend limits", () => {
   let tmp: { dbPath: string; cleanup: () => void };
   let upstream: ReturnType<typeof mockFetchUpstream>;
