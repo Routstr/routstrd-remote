@@ -82,5 +82,12 @@ bun -e '
 # directory, not just config.json.
 chown -R cloudron:cloudron /app/data
 
+# Everything under ${ROUTSTRD_DIR} is secret: config.json holds the container
+# nsec, wallet/config.json holds the Cashu wallet material, and routstr.db holds
+# every client API key in plaintext. Only the cloudron user needs to read any of
+# it, and /app/data is included in Cloudron's backups. Bun.write() leaves
+# config.json at 0644 (umask), so narrow it here on every start.
+chmod -R go-rwx "${ROUTSTRD_DIR}" 2>/dev/null || true
+
 echo "==> Starting supervisord..."
 exec /usr/bin/supervisord --configuration /etc/supervisor/supervisord-cloudron.conf -i RoutstrdApp

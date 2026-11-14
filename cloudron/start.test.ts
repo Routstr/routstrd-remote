@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -65,6 +65,7 @@ function createSandbox() {
   return {
     root,
     wallet: join(data, "routstrd/wallet/config.json"),
+    routstrdDir: join(data, "routstrd"),
     initialized: join(data, ".initialized"),
     run(mode = "success") {
       writeFileSync(trace, "");
@@ -87,6 +88,16 @@ function createSandbox() {
 }
 
 describe("Cloudron first-boot failure handling", () => {
+  it("narrows permissions on the routstrd data directory", () => sandbox((f) => {
+    // config.json (nsec), wallet material and routstr.db (client API keys) are
+    // all secret, and Bun.write() leaves them group/world readable.
+    const result = f.run();
+    expect(result.code).toBe(0);
+    const mode = (path: string) => statSync(path).mode & 0o777;
+    expect(mode(f.wallet)).toBe(0o600);
+    expect(mode(f.routstrdDir) & 0o077).toBe(0);
+  }));
+
   it("onboards and stops the daemon before configuration and supervisord", () => sandbox((f) => {
     const result = f.run();
     expect(result.code).toBe(0);

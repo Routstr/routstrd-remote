@@ -53,6 +53,9 @@ bun -e '
   await Bun.write(configPath, JSON.stringify(config, null, 2) + "\n");
 ' "${ROUTSTRD_CONFIG}" "${AUTH_URL}"
 
+# config.json holds the container nsec; Bun.write() leaves it at 0644.
+chmod -R go-rwx "$ROUTSTRD_DIR" 2>/dev/null || true
+
 _term() {
   echo "Shutting down..."
   if [ -n "${AUTH_PID:-}" ]; then
