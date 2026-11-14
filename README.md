@@ -27,6 +27,7 @@ All values have sensible defaults and can be overridden via environment variable
 | `ROUTSTRD_UPSTREAM` | `http://localhost:8009` | Upstream routstrd URL |
 | `ROUTSTRD_DB_PATH` | `~/.routstrd/routstr.db` | Shared SQLite DB |
 | `ROUTSTRD_AUTH_MODEL_ALLOWLIST` | `false` | Enable model allowlist enforcement (`true`/`false`) |
+| `ROUTSTRD_AUTH_PUBLIC_URL` | request headers | Origin NIP-98 signatures must bind to, e.g. `https://routstr.example.com` |
 | `ROUTSTRD_DIR` | `~/.routstrd` | Base config directory |
 
 ## First admin registration
@@ -290,6 +291,7 @@ The helper creates `Authorization: Nostr <base64-event>` headers whose signed ev
 - **Monthly spend cap** — paid requests are checked against the npub's cap and return `402` with `code: "monthly_quota_exceeded"` and `X-Routstr-Quota-*` headers once it is reached. See [Monthly spend limits per npub](#monthly-spend-limits-per-npub).
 - **Remove npubs** — `DELETE /npubs/<npub-or-pubkey>` (or `DELETE /npubs?npub=...`) requires NIP-98 auth from an existing admin.
 - **Forwarded headers** — the proxy strips `Authorization` and injects `x-routstr-client-id` so the daemon knows which client made the request.
+- **NIP-98 URL binding** — the `u` tag must match the public URL of the request. Set `ROUTSTRD_AUTH_PUBLIC_URL` (e.g. `https://routstr.example.com`) to bind to a fixed origin; without it the proxy derives the URL from the request's `Host` / `x-forwarded-*` headers, which the caller supplies, so a deployment that does not sit behind a proxy which overwrites them can have events signed for another host replayed here. The startup log says which mode is in effect.
 
 ## License
 

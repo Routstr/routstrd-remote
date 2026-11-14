@@ -244,7 +244,12 @@ export class AuthProxy {
     }
 
     try {
-      const { pubkey } = await validateNIP98Request(authorization, req, body);
+      const { pubkey } = await validateNIP98Request(
+        authorization,
+        req,
+        body,
+        this.config.publicUrl,
+      );
 
       const entry = this.store.getNpubByPubkey(pubkey);
       if (!entry) {
@@ -627,7 +632,12 @@ export class AuthProxy {
           }, 401);
         }
         try {
-          await validateNIP98Request(authorization, req, undefined);
+          await validateNIP98Request(
+            authorization,
+            req,
+            undefined,
+            this.config.publicUrl,
+          );
         } catch (err) {
           return this.json({
             error: err instanceof Error ? err.message : "Invalid NIP-98 token.",
@@ -937,6 +947,15 @@ export class AuthProxy {
     console.log(`  DB path:  ${this.config.dbPath}`);
     console.log(`  Registered npubs: ${npubCount}`);
     console.log(`  Model allowlist: ${this.config.modelAllowlistEnabled ? "enabled" : "disabled"}`);
+    if (this.config.publicUrl) {
+      console.log(`  NIP-98 URL binding: ${this.config.publicUrl} (ROUTSTRD_AUTH_PUBLIC_URL)`);
+    } else {
+      console.warn(
+        "  Warning: ROUTSTRD_AUTH_PUBLIC_URL is not set. NIP-98 requests are bound to the " +
+          "URL implied by the request's Host / x-forwarded-* headers, which the caller " +
+          "supplies. Set it to the app's public URL unless a proxy in front overwrites them.",
+      );
+    }
     if (npubCount === 0) {
       console.warn(
         "  Warning: no registered npub/pubkey. " +

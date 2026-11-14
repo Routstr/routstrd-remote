@@ -112,6 +112,39 @@ export interface AuthProxyConfig {
   invalidAdminPubkeys: string[];
   /** Whether model allowlist enforcement is enabled. */
   modelAllowlistEnabled: boolean;
+  /**
+   * Public origin NIP-98 events must have signed (`ROUTSTRD_AUTH_PUBLIC_URL`),
+   * e.g. `https://routstr.example.com`. When null the proxy falls back to the
+   * request's own URL plus `x-forwarded-*` headers, which the caller controls.
+   */
+  publicUrl: string | null;
+}
+
+/**
+ * Normalise `ROUTSTRD_AUTH_PUBLIC_URL` to an origin with no trailing slash, and
+ * reject anything that is not an absolute http(s) URL so a typo fails loudly
+ * instead of silently binding NIP-98 to a bogus string.
+ */
+export function normalizePublicUrl(value: string | undefined): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed) return null;
+
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    throw new Error(
+      `Invalid ROUTSTRD_AUTH_PUBLIC_URL: ${trimmed}. Expected an absolute URL such as https://routstr.example.com.`,
+    );
+  }
+
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new Error(
+      `Invalid ROUTSTRD_AUTH_PUBLIC_URL: ${trimmed}. Expected http or https.`,
+    );
+  }
+
+  return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
 }
 
 /**
@@ -129,6 +162,7 @@ export function loadConfig(): AuthProxyConfig {
     adminPubkeys: adminPubkeys.pubkeys,
     invalidAdminPubkeys: adminPubkeys.invalid,
     modelAllowlistEnabled: MODEL_ALLOWLIST_ENABLED,
+    publicUrl: normalizePublicUrl(process.env.ROUTSTRD_AUTH_PUBLIC_URL),
   };
 
   return config;

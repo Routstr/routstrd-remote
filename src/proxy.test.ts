@@ -6,6 +6,7 @@ import { tmpdir } from "os";
 import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools";
 import { AuthProxy, type AuthProxyConfig } from "./proxy";
 import { AuthStore } from "./store";
+import { normalizePublicUrl } from "./config";
 
 /**
  * Tests for model allowlist enforcement (AUTH-001).
@@ -94,6 +95,7 @@ function makeConfig(dbPath: string, overrides: Partial<AuthProxyConfig> = {}): A
     adminPubkeys: [],
     invalidAdminPubkeys: [],
     modelAllowlistEnabled: true,
+    publicUrl: null,
     ...overrides,
   };
 }
@@ -136,10 +138,17 @@ async function nip98Authorization(
   req: Request,
   body?: Uint8Array,
 ): Promise<string> {
-  const tags: string[][] = [
-    ["u", new URL(req.url).toString()],
-    ["method", req.method],
-  ];
+  return nip98AuthorizationFor(secretKey, new URL(req.url).toString(), req.method, body);
+}
+
+/** Sign a NIP-98 event for an explicit URL, independent of the Request. */
+async function nip98AuthorizationFor(
+  secretKey: Uint8Array,
+  url: string,
+  method: string,
+  body?: Uint8Array,
+): Promise<string> {
+  const tags: string[][] = [["u", url], ["method", method]];
   if (body && body.byteLength > 0) {
     tags.push(["payload", await sha256Hex(body)]);
   }
@@ -1347,6 +1356,92 @@ describe("daemon route capability boundary", () => {
 
     expect(res.status).toBe(400);
     expect(upstream.calls).toHaveLength(0);
+  });
+});
+
+describe("NIP-98 URL binding", () => {
+  let tmp: { dbPath: string; cleanup: () => void };
+  let proxy: AuthProxy;
+  const PUBLIC = "https://routstr.example.com";
+
+  beforeEach(() => {
+    tmp = createTmpDb();
+  });
+
+  afterEach(() => {
+    proxy?.close();
+    tmp.cleanup();
+  });
+
+  function start(publicUrl: string | null): Uint8Array {
+    const secretKey = generateSecretKey();
+    const store = new AuthStore(tmp.dbPath);
+    store.addNpub(getPublicKey(secretKey), "admin", null, "Alice");
+    store.close();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath, { publicUrl }));
+    return secretKey;
+  }
+
+  function get(token: string, extra: Record<string, string> = {}): Promise<Response> {
+    const headers: Record<string, string> = { ...extra, Authorization: token };
+    return proxy.handle(new Request("http://127.0.0.1:8008/npubs", { headers }));
+  }
+
+  it("binds to the configured public URL and ignores the caller's headers", async () => {
+    const secretKey = start(PUBLIC);
+    const token = await nip98AuthorizationFor(secretKey, `${PUBLIC}/npubs`, "GET");
+
+    // A caller-supplied forwarded host must not move the goalposts.
+    const res = await get(token, {
+      "x-forwarded-host": "evil.example",
+      "x-forwarded-proto": "https",
+    });
+
+    expect(res.status).toBe(200);
+  });
+
+  it("rejects an event signed for a different origin", async () => {
+    const secretKey = start(PUBLIC);
+    const token = await nip98AuthorizationFor(secretKey, "https://evil.example/npubs", "GET");
+
+    expect((await get(token)).status).toBe(401);
+  });
+
+  it("keeps the old header-derived behaviour when no public URL is set", async () => {
+    // Pins the behaviour ROUTSTRD_AUTH_PUBLIC_URL exists to replace: the host is
+    // whatever the request says it is.
+    const secretKey = start(null);
+    const token = await nip98AuthorizationFor(secretKey, "https://evil.example/npubs", "GET");
+
+    const res = await get(token, {
+      "x-forwarded-host": "evil.example",
+      "x-forwarded-proto": "https",
+    });
+
+    expect(res.status).toBe(200);
+  });
+
+  it("does not carry the internal port into a forwarded host", async () => {
+    // Setting URL.host keeps the old port, so this used to compute
+    // https://app.example:8008/npubs and reject the event a proxy actually
+    // signed for https://app.example/npubs.
+    const secretKey = start(null);
+    const token = await nip98AuthorizationFor(secretKey, "https://app.example/npubs", "GET");
+
+    const res = await get(token, {
+      "x-forwarded-host": "app.example",
+      "x-forwarded-proto": "https",
+    });
+
+    expect(res.status).toBe(200);
+  });
+
+  it("normalises the configured value", () => {
+    expect(normalizePublicUrl("https://Routstr.example.com/")).toBe("https://routstr.example.com");
+    expect(normalizePublicUrl("")).toBeNull();
+    expect(normalizePublicUrl(undefined)).toBeNull();
+    expect(() => normalizePublicUrl("not-a-url")).toThrow(/ROUTSTRD_AUTH_PUBLIC_URL/);
+    expect(() => normalizePublicUrl("file:///etc/passwd")).toThrow(/http or https/);
   });
 });
 
