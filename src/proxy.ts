@@ -1082,10 +1082,14 @@ export class AuthProxy {
         // still attributed by the npub suffix, so they are unaffected -- the
         // suffix is the only signal they have.
         return this.json({
+          // Deliberately does not offer 're-create the client' as a remedy: the
+          // owner is recorded at creation, so a replacement key is owned by
+          // whoever creates it and is capped against their limit, not the
+          // original owner's. Re-registering the npub is the action that
+          // restores this key, so name only that.
           error:
             "This API key belongs to an npub that is no longer registered, so it no longer works. " +
-            "Ask an admin to register the npub again, or create a new client with " +
-            "'routstrd clients add'.",
+            "An admin can restore it by registering that npub again.",
           code: "client_owner_not_registered",
         }, 403);
       }

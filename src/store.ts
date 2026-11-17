@@ -42,6 +42,30 @@ interface NpubRow {
 const NPUB_COLUMNS =
   "pubkey, npub, name, created_at, created_by, source, role, monthly_limit_sats";
 
+/**
+ * Pubkeys that must be deleted, not demoted, when they disappear from
+ * `ROUTSTRD_AUTH_ADMIN_NPUBS`.
+ *
+ * `reconcileEnvAdminPubkeys` cannot tell a security revocation from a routine
+ * configuration change by looking at the env var alone, so a revocation has to
+ * be declared here. Leaving a compromised pubkey in the table as an ordinary
+ * admin is not an acceptable outcome, so this list is the safety valve.
+ *
+ * The first entry is the npub `docker-entrypoint.sh` used to default
+ * `ROUTSTRD_AUTH_ADMIN_NPUBS` to, which silently granted admin on every
+ * deployment that never overrode the variable. It is purged on sight, exactly
+ * as before — see dc95d27.
+ *
+ * Adding to this list is a permanent, one-way action for deployments that still
+ * have the row: the npub is deleted on the next start, and re-adding it to
+ * `ROUTSTRD_AUTH_ADMIN_NPUBS` will only re-create it if the operator does so
+ * after this file changes.
+ */
+export const RETIRED_ENV_ADMIN_PUBKEYS: ReadonlySet<string> = new Set([
+  // Hardcoded default admin npub from docker-entrypoint.sh before dc95d27.
+  "fc76f8bdeeafc37a5a499b3a24064774d8a5a02c299a64aca072cf8c6c827b1f",
+]);
+
 function rowToNpubEntry(row: NpubRow): NpubEntry {
   return {
     pubkey: row.pubkey,
@@ -143,16 +167,73 @@ export class AuthStore {
         insert.run(pubkey, nip19.npubEncode(pubkey), now);
       }
 
-      const envRows = this.db
-        .query("SELECT pubkey FROM routstr_auth_npubs WHERE source = 'env'")
-        .all() as Array<{ pubkey: string }>;
-      const remove = this.db.prepare(
-        "DELETE FROM routstr_auth_npubs WHERE source = 'env' AND pubkey = ?",
+      // Rows still listed in the env var are env-managed, so pin them to
+      // `source = 'env'`. Without this, an operator who also added the npub
+      // through `POST /npubs` keeps an `api` row (addNpub is INSERT OR IGNORE,
+      // so it silently reports added: false and the row keeps source='env'
+      // anyway) and the two views of the same npub disagree about who owns it.
+      // The env var is the ground truth for "is this env-managed?", not
+      // whatever a row happens to say.
+      const markEnv = this.db.prepare(
+        "UPDATE routstr_auth_npubs SET source = 'env' WHERE pubkey = ? AND source != 'env'",
       );
+      for (const pubkey of uniquePubkeys) {
+        markEnv.run(pubkey);
+      }
+
+      const envRows = this.db
+        .query("SELECT pubkey, npub FROM routstr_auth_npubs WHERE source = 'env'")
+        .all() as Array<{ pubkey: string; npub: string }>;
+
+      const isRetired = (pubkey: string) => RETIRED_ENV_ADMIN_PUBKEYS.has(pubkey);
+
+      // Two very different meanings hide behind "no longer in the env var", and
+      // they must not be handled the same way:
+      //
+      //   1. The operator retired a known-compromised pubkey. That is a
+      //      security revocation, so the row is deleted. This is the original
+      //      reason reconcile deletes at all -- it is how the hardcoded default
+      //      admin was purged in dc95d27 -- and it has to keep working.
+      //
+      //   2. The operator moved admin configuration from the env var into the
+      //      database, re-typed the variable, or rolled back a deploy. That is
+      //      a configuration change, so the row is *demoted to an ordinary
+      //      registration* instead.
+      //
+      // Deleting in case 2 is indistinguishable from an operator revoking that
+      // npub: it takes the npub's own API keys with it, because a key whose
+      // recorded owner is no longer registered is now refused with
+      // `client_owner_not_registered` -- a message that says the owner was
+      // removed, when nobody was removed. When it was the last npub it also
+      // empties the table and re-opens the anonymous first-admin bootstrap
+      // window that the bootstrap-token work is there to close. Retiring an env
+      // var must not be able to do either, so only an explicit retirement
+      // deletes.
+      const remove = this.db.prepare("DELETE FROM routstr_auth_npubs WHERE pubkey = ?");
+      const demote = this.db.prepare(
+        "UPDATE routstr_auth_npubs SET source = 'api' WHERE pubkey = ?",
+      );
+      const demoted: string[] = [];
+
       for (const row of envRows) {
-        if (!keep.has(row.pubkey.toLowerCase())) {
+        if (keep.has(row.pubkey.toLowerCase())) continue;
+        if (isRetired(row.pubkey)) {
           remove.run(row.pubkey);
+        } else {
+          demote.run(row.pubkey);
+          demoted.push(row.npub);
         }
+      }
+
+      if (demoted.length > 0) {
+        console.warn(
+          `  Warning: ${demoted.length} npub(s) are no longer in ROUTSTRD_AUTH_ADMIN_NPUBS but stayed ` +
+            `registered as ordinary entries, so their existing API keys keep working: ${demoted.join(", ")}.`,
+        );
+        console.warn(
+          "  This was treated as a configuration change, not a revocation. To revoke one, use " +
+            "'DELETE /npubs/<npub>', or add it back to ROUTSTRD_AUTH_ADMIN_NPUBS and retire it from there.",
+        );
       }
     })();
   }
