@@ -119,6 +119,13 @@ export interface AuthProxyConfig {
    * request's own URL plus `x-forwarded-*` headers, which the caller controls.
    */
   publicUrl: string | null;
+  /**
+   * One-time token that authorises the first-admin bootstrap while the npub
+   * table is empty. `null` means "generate one at startup" (and log it), which
+   * is what happens when the operator does not set
+   * `ROUTSTRD_AUTH_BOOTSTRAP_TOKEN`.
+   */
+  bootstrapToken: string | null;
 }
 
 /**
@@ -135,17 +142,24 @@ export function normalizePublicUrl(value: string | undefined): string | null {
     url = new URL(trimmed);
   } catch {
     throw new Error(
-      `Invalid ROUTSTRD_AUTH_PUBLIC_URL: ${trimmed}. Expected an absolute URL such as https://routstr.example.com.`,
+      `Invalid public URL (ROUTSTRD_AUTH_PUBLIC_URL or CLOUDRON_APP_ORIGIN). Expected an absolute URL such as https://routstr.example.com.`,
     );
   }
 
   if (url.protocol !== "https:" && url.protocol !== "http:") {
     throw new Error(
-      `Invalid ROUTSTRD_AUTH_PUBLIC_URL: ${trimmed}. Expected http or https.`,
+      `Invalid public URL (ROUTSTRD_AUTH_PUBLIC_URL or CLOUDRON_APP_ORIGIN). Expected http or https.`,
     );
   }
 
-  return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
+  if (url.username || url.password || url.pathname !== "/" ||
+      trimmed.includes("?") || trimmed.includes("#")) {
+    throw new Error(
+      "Invalid public URL (ROUTSTRD_AUTH_PUBLIC_URL or CLOUDRON_APP_ORIGIN): " +
+        "expected an origin without credentials, a non-root path, query, or fragment.",
+    );
+  }
+  return url.origin;
 }
 
 /**
@@ -163,6 +177,7 @@ export function loadConfig(): AuthProxyConfig {
     adminPubkeys: adminPubkeys.pubkeys,
     invalidAdminPubkeys: adminPubkeys.invalid,
     modelAllowlistEnabled: MODEL_ALLOWLIST_ENABLED,
+    bootstrapToken: process.env.ROUTSTRD_AUTH_BOOTSTRAP_TOKEN || null,
     publicUrl: normalizePublicUrl(
       process.env.ROUTSTRD_AUTH_PUBLIC_URL?.trim() || process.env.CLOUDRON_APP_ORIGIN,
     ),

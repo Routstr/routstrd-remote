@@ -3,10 +3,15 @@ import { Database } from "bun:sqlite";
 import { join } from "path";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
-import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools";
-import { AuthProxy, type AuthProxyConfig } from "./proxy";
-import { AuthStore } from "./store";
-import { normalizePublicUrl } from "./config";
+import { finalizeEvent, generateSecretKey, getPublicKey, nip19 } from "nostr-tools";
+import {
+  AuthProxy,
+  BOOTSTRAP_TOKEN_HEADER,
+  MAX_MANAGEMENT_BODY_BYTES,
+} from "./proxy";
+import { validateNIP98Request } from "./nip98";
+import { normalizePublicUrl, type AuthProxyConfig } from "./config";
+import { AuthStore, RETIRED_ENV_ADMIN_PUBKEYS } from "./store";
 
 /**
  * Tests for model allowlist enforcement (AUTH-001).
@@ -85,6 +90,10 @@ function setUsage(
   db.close();
 }
 
+/** The first-admin claim needs this header while the npub table is empty. */
+const TEST_BOOTSTRAP_TOKEN = "test-bootstrap-token";
+const BOOTSTRAP_HEADERS = { [BOOTSTRAP_TOKEN_HEADER]: TEST_BOOTSTRAP_TOKEN };
+
 function makeConfig(dbPath: string, overrides: Partial<AuthProxyConfig> = {}): AuthProxyConfig {
   return {
     port: 0, // not used — we call handle() directly
@@ -95,6 +104,7 @@ function makeConfig(dbPath: string, overrides: Partial<AuthProxyConfig> = {}): A
     adminPubkeys: [],
     invalidAdminPubkeys: [],
     modelAllowlistEnabled: true,
+    bootstrapToken: TEST_BOOTSTRAP_TOKEN,
     publicUrl: null,
     ...overrides,
   };
@@ -218,6 +228,7 @@ describe("npub name endpoints", () => {
     const pubkey = "ef".repeat(32);
     const req = new Request("http://localhost:8008/npubs", {
       method: "POST",
+      headers: BOOTSTRAP_HEADERS,
       body: JSON.stringify({ pubkey, name: "  Alice  " }),
     });
 
@@ -231,6 +242,7 @@ describe("npub name endpoints", () => {
   it("POST /npubs rejects a non-string name with 400", async () => {
     const req = new Request("http://localhost:8008/npubs", {
       method: "POST",
+      headers: BOOTSTRAP_HEADERS,
       body: JSON.stringify({ pubkey: "ef".repeat(32), name: 42 }),
     });
 
@@ -241,6 +253,7 @@ describe("npub name endpoints", () => {
   it("POST /npubs rejects a name over 64 characters with 400", async () => {
     const req = new Request("http://localhost:8008/npubs", {
       method: "POST",
+      headers: BOOTSTRAP_HEADERS,
       body: JSON.stringify({ pubkey: "ef".repeat(32), name: "x".repeat(65) }),
     });
 
@@ -321,6 +334,7 @@ describe("npub name endpoints", () => {
     const res = await proxy.handle(
       new Request("http://localhost:8008/npubs", {
         method: "POST",
+        headers: BOOTSTRAP_HEADERS,
         body: JSON.stringify({ pubkey: "ef".repeat(32) }),
       }),
     );
@@ -338,6 +352,7 @@ describe("npub name endpoints", () => {
     const retry = await proxy.handle(
       new Request("http://localhost:8008/npubs", {
         method: "POST",
+        headers: BOOTSTRAP_HEADERS,
         body: JSON.stringify({ pubkey: "ef".repeat(32), name: "Alice" }),
       }),
     );
@@ -378,6 +393,7 @@ describe("npub name endpoints", () => {
     const res = await proxy.handle(
       new Request("http://localhost:8008/npubs", {
         method: "POST",
+        headers: BOOTSTRAP_HEADERS,
         body: JSON.stringify({ pubkey: "ef".repeat(32), name: null }),
       }),
     );
@@ -390,6 +406,7 @@ describe("npub name endpoints", () => {
     const res = await proxy.handle(
       new Request("http://localhost:8008/npubs", {
         method: "POST",
+        headers: BOOTSTRAP_HEADERS,
         body: JSON.stringify({ pubkey: "ef".repeat(32), name: "   " }),
       }),
     );
@@ -402,6 +419,7 @@ describe("npub name endpoints", () => {
     const res = await proxy.handle(
       new Request("http://localhost:8008/npubs", {
         method: "POST",
+        headers: BOOTSTRAP_HEADERS,
         body: JSON.stringify("ef".repeat(32)),
       }),
     );
@@ -471,6 +489,7 @@ describe("npub name endpoints", () => {
   it("POST /npubs accepts a 64-character name", async () => {
     const req = new Request("http://localhost:8008/npubs", {
       method: "POST",
+      headers: BOOTSTRAP_HEADERS,
       body: JSON.stringify({ pubkey: "ef".repeat(32), name: "x".repeat(64) }),
     });
 
@@ -1359,6 +1378,450 @@ describe("daemon route capability boundary", () => {
   });
 });
 
+describe("first-admin bootstrap token", () => {
+  let tmp: { dbPath: string; cleanup: () => void };
+  let proxy: AuthProxy;
+
+  beforeEach(() => {
+    tmp = createTmpDb();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+  });
+
+  afterEach(() => {
+    proxy?.close();
+    tmp.cleanup();
+  });
+
+  const claim = (headers: Record<string, string> = {}, body?: unknown) =>
+    proxy.handle(
+      new Request("http://localhost:8008/npubs", {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body ?? { pubkey: "ef".repeat(32), name: "Alice" }),
+      }),
+    );
+
+  it("refuses an anonymous claim while the table is empty", async () => {
+    const res = await claim();
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.code).toBe("bootstrap_token_required");
+    expect(body.error).toContain(BOOTSTRAP_TOKEN_HEADER);
+
+    const store = new AuthStore(tmp.dbPath);
+    expect(store.countNpubs()).toBe(0);
+    store.close();
+  });
+
+  it("refuses a wrong token", async () => {
+    const res = await claim({ [BOOTSTRAP_TOKEN_HEADER]: "not-the-token" });
+    expect(res.status).toBe(403);
+    expect((await res.json()).code).toBe("bootstrap_token_required");
+  });
+
+  it("still refuses when the caller brings a valid NIP-98 event", async () => {
+    const secretKey = generateSecretKey();
+    const payload = new TextEncoder().encode(
+      JSON.stringify({ pubkey: "ef".repeat(32), name: "Alice" }),
+    );
+    const signed = new Request("http://localhost:8008/npubs", {
+      method: "POST",
+      body: payload,
+    });
+    const auth = await nip98Authorization(secretKey, signed, payload);
+    const headers: Record<string, string> = { Authorization: auth };
+
+    const res = await proxy.handle(
+      new Request("http://localhost:8008/npubs", {
+        method: "POST",
+        headers,
+        body: payload,
+      }),
+    );
+
+    expect(res.status).toBe(403);
+    expect((await res.json()).code).toBe("bootstrap_token_required");
+  });
+
+  it("claims the first admin with the token and voids it afterwards", async () => {
+    expect(proxy.getBootstrapToken()).toBe(TEST_BOOTSTRAP_TOKEN);
+
+    const res = await claim(BOOTSTRAP_HEADERS);
+    expect(res.status).toBe(201);
+    expect((await res.json()).role).toBe("admin");
+
+    // Single use: the token no longer authorises anything, and the window is
+    // closed by the store now holding an npub anyway -- an unauthenticated
+    // claim is back to being a plain missing-credential 401.
+    expect(proxy.getBootstrapToken()).toBeNull();
+    const again = await claim(BOOTSTRAP_HEADERS, { pubkey: "ab".repeat(32), name: "Bob" });
+    expect(again.status).toBe(401);
+  });
+
+  it("accepts an operator-supplied ROUTSTRD_AUTH_BOOTSTRAP_TOKEN", async () => {
+    proxy.close();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath, { bootstrapToken: "from-the-environment" }));
+
+    const wrong = await claim({ [BOOTSTRAP_TOKEN_HEADER]: TEST_BOOTSTRAP_TOKEN });
+    expect(wrong.status).toBe(403);
+
+    const res = await claim({ [BOOTSTRAP_TOKEN_HEADER]: "from-the-environment" });
+    expect(res.status).toBe(201);
+  });
+
+  it("mints no token when an npub already exists", async () => {
+    const store = new AuthStore(tmp.dbPath);
+    store.addNpub("ef".repeat(32), "admin", null, "Alice");
+    store.close();
+
+    proxy.close();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath, { bootstrapToken: null }));
+    expect(proxy.getBootstrapToken()).toBeNull();
+  });
+});
+
+describe("management body limits", () => {
+  let tmp: { dbPath: string; cleanup: () => void };
+  let proxy: AuthProxy;
+
+  beforeEach(() => {
+    tmp = createTmpDb();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+  });
+
+  afterEach(() => {
+    proxy?.close();
+    tmp.cleanup();
+  });
+
+  it("answers an anonymous request without reading its body", async () => {
+    // A body this size is refused with 413 once a caller is authorised, so a
+    // 401 here proves the credential check ran on the headers and the body was
+    // never buffered. (Asserting "the stream was not pulled" is not reliable:
+    // Bun pulls ReadableStream request bodies eagerly on its own.)
+    const res = await proxy.handle(
+      new Request("http://localhost:8008/clients/add", {
+        method: "POST",
+        headers: { "Content-Length": String(MAX_MANAGEMENT_BODY_BYTES * 4) },
+        body: "{}",
+      }),
+    );
+
+    expect(res.status).toBe(401);
+  });
+
+  it("refuses a declared oversized body with 413", async () => {
+    const res = await proxy.handle(
+      new Request("http://localhost:8008/npubs", {
+        method: "POST",
+        headers: BOOTSTRAP_HEADERS,
+        body: "x".repeat(MAX_MANAGEMENT_BODY_BYTES + 1),
+      }),
+    );
+
+    expect(res.status).toBe(413);
+    expect((await res.json()).code).toBe("request_body_too_large");
+  });
+
+  it("refuses an oversized chunked body that declares no length", async () => {
+    let sent = 0;
+    const total = MAX_MANAGEMENT_BODY_BYTES + 128 * 1024;
+    const stream = new ReadableStream({
+      pull(controller) {
+        if (sent >= total) {
+          controller.close();
+          return;
+        }
+        const chunk = new Uint8Array(64 * 1024);
+        sent += chunk.byteLength;
+        controller.enqueue(chunk);
+      },
+    });
+
+    const res = await proxy.handle(
+      new Request("http://localhost:8008/npubs", {
+        method: "POST",
+        headers: BOOTSTRAP_HEADERS,
+        body: stream,
+        duplex: "half",
+      } as unknown as RequestInit),
+    );
+
+    expect(res.status).toBe(413);
+  });
+
+  it("still accepts a body just under the limit", async () => {
+    const padding = "x".repeat(MAX_MANAGEMENT_BODY_BYTES - 128);
+    const res = await proxy.handle(
+      new Request("http://localhost:8008/npubs", {
+        method: "POST",
+        headers: BOOTSTRAP_HEADERS,
+        body: JSON.stringify({ pubkey: "ef".repeat(32), name: padding }),
+      }),
+    );
+
+    // 400 (name too long), not 413: the body itself was accepted.
+    expect(res.status).toBe(400);
+  });
+});
+
+describe("revocation when an npub is removed", () => {
+  let tmp: { dbPath: string; cleanup: () => void };
+  let upstream: ReturnType<typeof mockFetchUpstream>;
+  let proxy: AuthProxy;
+
+  beforeEach(() => {
+    tmp = createTmpDb();
+    upstream = mockFetchUpstream();
+  });
+
+  afterEach(() => {
+    proxy?.close();
+    upstream.restore();
+    tmp.cleanup();
+  });
+
+  function registerOwner(name = "Alice"): { pubkey: string; npub: string } {
+    const store = new AuthStore(tmp.dbPath);
+    const entry = store.addNpub("cd".repeat(32), "user", null, name);
+    store.close();
+    return { pubkey: entry.pubkey, npub: entry.npub };
+  }
+
+  function inference(apiKey: string): Promise<Response> {
+    proxy?.close();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+    return proxy.handle(
+      new Request("http://localhost:8008/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ model: "routstr/gpt-4o", messages: [] }),
+      }),
+    );
+  }
+
+  it("refuses a client whose owner npub was removed", async () => {
+    const owner = registerOwner();
+    setClients(tmp.dbPath, [
+      {
+        clientId: "laptop",
+        name: "Laptop",
+        apiKey: "sk-owned-by-alice",
+        createdAt: 0,
+        lastUsed: null,
+        ownerNpub: owner.npub,
+      },
+    ]);
+
+    const before = await inference("sk-owned-by-alice");
+    expect(before.status).toBe(200);
+
+    const store = new AuthStore(tmp.dbPath);
+    store.removeNpub(owner.pubkey);
+    store.close();
+
+    // The key is still in the daemon's storage; the proxy is what stops it.
+    const after = await inference("sk-owned-by-alice");
+    expect(after.status).toBe(403);
+    expect((await after.json()).code).toBe("client_owner_not_registered");
+    expect(upstream.calls).toHaveLength(1);
+  });
+
+  it("keeps working when the npub is registered again", async () => {
+    const owner = registerOwner();
+    setClients(tmp.dbPath, [
+      {
+        clientId: "laptop",
+        name: "Laptop",
+        apiKey: "sk-owned-by-alice",
+        createdAt: 0,
+        lastUsed: null,
+        ownerNpub: owner.npub,
+      },
+    ]);
+
+    const store = new AuthStore(tmp.dbPath);
+    store.removeNpub(owner.pubkey);
+    store.close();
+    expect((await inference("sk-owned-by-alice")).status).toBe(403);
+
+    const again = new AuthStore(tmp.dbPath);
+    again.addNpub(owner.pubkey, "user", null, "Alice");
+    again.close();
+
+    expect((await inference("sk-owned-by-alice")).status).toBe(200);
+  });
+
+  it("still serves a legacy client that records no owner", async () => {
+    // Clients created before `ownerNpub` existed have only the id suffix to go
+    // on, so they stay usable; this is the documented gap, pinned here so a
+    // future change to it is deliberate.
+    registerOwner();
+    setClients(tmp.dbPath, [
+      {
+        clientId: "legacy-box",
+        name: "Legacy",
+        apiKey: "sk-legacy",
+        createdAt: 0,
+        lastUsed: null,
+      },
+    ]);
+
+    expect((await inference("sk-legacy")).status).toBe(200);
+  });
+});
+
+describe("retiring ROUTSTRD_AUTH_ADMIN_NPUBS revokes admin but not clients", () => {
+  // A pubkey leaving the env var loses admin (dc95d27), but it must not look
+  // like an operator deleting that npub: deletion is what refuses the npub's
+  // existing API keys and (when it was the last npub) re-opens the first-admin
+  // bootstrap window.
+  let tmp: { dbPath: string; cleanup: () => void };
+  let upstream: ReturnType<typeof mockFetchUpstream>;
+  let proxy: AuthProxy;
+
+  const ENV_ADMIN_PUBKEY = "12".repeat(32);
+
+  beforeEach(() => {
+    tmp = createTmpDb();
+    upstream = mockFetchUpstream();
+  });
+
+  afterEach(() => {
+    proxy?.close();
+    upstream.restore();
+    tmp.cleanup();
+  });
+
+  /** Start a proxy with the admin configured the given way. */
+  function boot(envAdmins: string[]): AuthProxy {
+    proxy?.close();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath, { adminPubkeys: envAdmins }));
+    return proxy;
+  }
+
+  function inference(apiKey: string): Promise<Response> {
+    return proxy.handle(
+      new Request("http://localhost:8008/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ model: "routstr/gpt-4o", messages: [] }),
+      }),
+    );
+  }
+
+  const CLAIM_HEADERS = BOOTSTRAP_HEADERS;
+
+  it("keeps an env-configured admin's API key working after the env var is retired", async () => {
+    boot([ENV_ADMIN_PUBKEY]);
+    setClients(tmp.dbPath, [
+      {
+        clientId: "laptop",
+        name: "Laptop",
+        apiKey: "sk-alice",
+        createdAt: 0,
+        lastUsed: null,
+        ownerNpub: nip19.npubEncode(ENV_ADMIN_PUBKEY),
+      },
+    ]);
+
+    expect((await inference("sk-alice")).status).toBe(200);
+
+    // Operator moves the admin registration into the database by retiring the
+    // variable. The key must keep working: nobody was revoked.
+    boot([]);
+    const after = await inference("sk-alice");
+    expect(after.status).toBe(200);
+    expect(await after.json()).not.toHaveProperty("code");
+  });
+
+  it("does not re-open the first-admin bootstrap window when the env var is retired", async () => {
+    boot([ENV_ADMIN_PUBKEY]);
+    // Retiring the only admin used to empty the table, which made POST /npubs
+    // claimable again with the startup token and reset the bootstrap window.
+    boot([]);
+
+    const store = new AuthStore(tmp.dbPath);
+    expect(store.countNpubs()).toBe(1);
+    store.close();
+
+    // The npub still exists, so an unauthenticated claim is refused for the
+    // ordinary reason: no credential, not a claimable empty instance.
+    const res = await proxy.handle(
+      new Request("http://localhost:8008/npubs", {
+        method: "POST",
+        headers: CLAIM_HEADERS,
+        body: JSON.stringify({ pubkey: "ef".repeat(32), name: "Attacker" }),
+      }),
+    );
+    expect(res.status).not.toBe(201);
+    expect(res.status).toBe(401);
+  });
+
+  it("still deletes an explicitly retired pubkey instead of demoting it", async () => {
+    // Demotion must not become a way for a known-compromised admin to survive.
+    const retired = [...RETIRED_ENV_ADMIN_PUBKEYS][0]!;
+    boot([retired, ENV_ADMIN_PUBKEY]);
+    boot([ENV_ADMIN_PUBKEY]);
+
+    const store = new AuthStore(tmp.dbPath);
+    expect(store.hasNpub(retired)).toBe(false);
+    expect(store.hasNpub(ENV_ADMIN_PUBKEY)).toBe(true);
+    store.close();
+  });
+
+  it("takes admin rights away from a pubkey that left the env var", async () => {
+    // Regression guard for dc95d27: removing someone from the variable must
+    // not leave them able to move funds.
+    const secret = generateSecretKey();
+    const pubkey = getPublicKey(secret);
+
+    async function walletSend(): Promise<Response> {
+      const payload = new TextEncoder().encode("{}");
+      const req = new Request("http://localhost:8008/wallet/send/cashu", {
+        method: "POST",
+        body: payload,
+      });
+      const auth = await nip98Authorization(secret, req, payload);
+      return proxy.handle(
+        new Request(req.url, { method: "POST", headers: { Authorization: auth }, body: payload }),
+      );
+    }
+
+    boot([pubkey]);
+    expect((await walletSend()).status).toBe(200);
+
+    boot([]);
+    expect((await walletSend()).status).toBe(403);
+    expect(upstream.calls).toHaveLength(1);
+  });
+
+  it("warns when a retired-from-env npub loses admin and keeps its registration", async () => {
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      boot([ENV_ADMIN_PUBKEY]);
+      warn.mockClear();
+      boot([]);
+      const messages = warn.mock.calls.map((c) => c.join(" ")).join("\n");
+      expect(messages).toContain(nip19.npubEncode(ENV_ADMIN_PUBKEY));
+      expect(messages).toContain("no longer admin");
+      expect(messages).toContain("DELETE /npubs/");
+      expect(messages).toContain("PATCH /npubs");
+      // It was the only admin, so the operator must be told how to get back in.
+      expect(messages).toContain("no admin npub is registered");
+      expect(messages).not.toContain("retire it from there");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
 describe("NIP-98 URL binding", () => {
   let tmp: { dbPath: string; cleanup: () => void };
   let proxy: AuthProxy;
@@ -1434,6 +1897,26 @@ describe("NIP-98 URL binding", () => {
     });
 
     expect(res.status).toBe(200);
+  });
+
+  it("binds the exact query and preserves the configured port", async () => {
+    const secret = generateSecretKey();
+    const req = new Request("http://localhost:8008/npubs?name=Alice");
+    const token = await nip98AuthorizationFor(secret, "https://app.example:8443/npubs?name=Alice", "GET");
+    expect((await validateNIP98Request(token, req, undefined, "https://app.example:8443")).pubkey)
+      .toBe(getPublicKey(secret));
+    await expect(validateNIP98Request(token, new Request("http://localhost:8008/npubs?name=Bob"), undefined,
+      "https://app.example:8443")).rejects.toThrow(/URL tag/);
+  });
+
+  it("cannot replace the configured origin through a double-slash path", async () => {
+    const secret = generateSecretKey();
+    const req = new Request("http://localhost:8008//evil.example/npubs");
+    const wrong = await nip98AuthorizationFor(secret, "https://evil.example/npubs", "GET");
+    await expect(validateNIP98Request(wrong, req, undefined, PUBLIC)).rejects.toThrow(/URL tag/);
+    const correct = await nip98AuthorizationFor(secret, `${PUBLIC}//evil.example/npubs`, "GET");
+    expect((await validateNIP98Request(correct, req, undefined, PUBLIC)).pubkey)
+      .toBe(getPublicKey(secret));
   });
 
   it("normalises the configured value", () => {
@@ -1724,6 +2207,7 @@ describe("Monthly spend limits", () => {
     const res = await proxyWithoutDb().handle(
       new Request("http://localhost:8008/npubs", {
         method: "POST",
+        headers: BOOTSTRAP_HEADERS,
         body: JSON.stringify({ pubkey, name: "Alice", monthlyLimitSats: 2_500 }),
       }),
     );

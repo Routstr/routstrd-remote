@@ -60,7 +60,11 @@ function getAbsoluteRequestUrl(req: Request, publicUrl?: string | null): string 
   const url = new URL(req.url);
 
   if (publicUrl) {
-    return new URL(`${url.pathname}${url.search}`, publicUrl).toString();
+    const expected = new URL(publicUrl);
+    // Assign components: a leading // must not replace the configured authority.
+    expected.pathname = url.pathname;
+    expected.search = url.search;
+    return expected.toString();
   }
 
   const forwardedProto = firstHeaderValue(req.headers.get("x-forwarded-proto"));
@@ -111,7 +115,7 @@ function decodeAuthorizationEvent(authorization: string): Event {
 }
 
 /**
- * Validate an `Authorization: Nostr *** request according to NIP-98.
+ * Validate an `Authorization: Nostr <base64-event>` request according to NIP-98.
  *
  * The signed event must bind to the exact public request URL and method. If the
  * request has a non-empty body, a `payload` tag containing the SHA-256 hex hash

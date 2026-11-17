@@ -1,5 +1,5 @@
 import { describe, it, expect } from "bun:test";
-import { isModelAllowlistEnabled, loadConfig } from "./config";
+import { isModelAllowlistEnabled, loadConfig, normalizePublicUrl } from "./config";
 
 describe("isModelAllowlistEnabled", () => {
   it("defaults to disabled when the env value is unset", () => {
@@ -61,5 +61,22 @@ describe("public URL environment precedence", () => {
   it("rejects invalid selected configuration rather than falling back", () => {
     expect(() => configured("invalid", "https://app.example")).toThrow();
     expect(() => configured(undefined, "invalid")).toThrow();
+  });
+});
+
+describe("public URL origin validation", () => {
+  it("rejects paths, credentials, queries and fragments", () => {
+    for (const value of [
+      "https://example.com/subpath", "https://user:secret@example.com",
+      "https://example.com?x=1", "https://example.com#section",
+      "https://example.com?", "https://example.com#",
+    ]) {
+      expect(() => normalizePublicUrl(value)).toThrow();
+    }
+  });
+
+  it("preserves a configured non-default port", () => {
+    expect(normalizePublicUrl(" https://Example.com:8443/ "))
+      .toBe("https://example.com:8443");
   });
 });
