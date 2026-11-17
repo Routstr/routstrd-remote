@@ -3,14 +3,14 @@ import { Database } from "bun:sqlite";
 import { join } from "path";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
-import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools";
+import { finalizeEvent, generateSecretKey, getPublicKey, nip19 } from "nostr-tools";
 import {
   AuthProxy,
   BOOTSTRAP_TOKEN_HEADER,
   MAX_MANAGEMENT_BODY_BYTES,
 } from "./proxy";
 import type { AuthProxyConfig } from "./config";
-import { AuthStore } from "./store";
+import { AuthStore, RETIRED_ENV_ADMIN_PUBKEYS } from "./store";
 
 /**
  * Tests for model allowlist enforcement (AUTH-001).
@@ -1662,6 +1662,154 @@ describe("revocation when an npub is removed", () => {
     ]);
 
     expect((await inference("sk-legacy")).status).toBe(200);
+  });
+});
+
+describe("retiring ROUTSTRD_AUTH_ADMIN_NPUBS revokes admin but not clients", () => {
+  // A pubkey leaving the env var loses admin (dc95d27), but it must not look
+  // like an operator deleting that npub: deletion is what refuses the npub's
+  // existing API keys and (when it was the last npub) re-opens the first-admin
+  // bootstrap window.
+  let tmp: { dbPath: string; cleanup: () => void };
+  let upstream: ReturnType<typeof mockFetchUpstream>;
+  let proxy: AuthProxy;
+
+  const ENV_ADMIN_PUBKEY = "12".repeat(32);
+
+  beforeEach(() => {
+    tmp = createTmpDb();
+    upstream = mockFetchUpstream();
+  });
+
+  afterEach(() => {
+    proxy?.close();
+    upstream.restore();
+    tmp.cleanup();
+  });
+
+  /** Start a proxy with the admin configured the given way. */
+  function boot(envAdmins: string[]): AuthProxy {
+    proxy?.close();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath, { adminPubkeys: envAdmins }));
+    return proxy;
+  }
+
+  function inference(apiKey: string): Promise<Response> {
+    return proxy.handle(
+      new Request("http://localhost:8008/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ model: "routstr/gpt-4o", messages: [] }),
+      }),
+    );
+  }
+
+  const CLAIM_HEADERS = BOOTSTRAP_HEADERS;
+
+  it("keeps an env-configured admin's API key working after the env var is retired", async () => {
+    boot([ENV_ADMIN_PUBKEY]);
+    setClients(tmp.dbPath, [
+      {
+        clientId: "laptop",
+        name: "Laptop",
+        apiKey: "sk-alice",
+        createdAt: 0,
+        lastUsed: null,
+        ownerNpub: nip19.npubEncode(ENV_ADMIN_PUBKEY),
+      },
+    ]);
+
+    expect((await inference("sk-alice")).status).toBe(200);
+
+    // Operator moves the admin registration into the database by retiring the
+    // variable. The key must keep working: nobody was revoked.
+    boot([]);
+    const after = await inference("sk-alice");
+    expect(after.status).toBe(200);
+    expect(await after.json()).not.toHaveProperty("code");
+  });
+
+  it("does not re-open the first-admin bootstrap window when the env var is retired", async () => {
+    boot([ENV_ADMIN_PUBKEY]);
+    // Retiring the only admin used to empty the table, which made POST /npubs
+    // claimable again with the startup token and reset the bootstrap window.
+    boot([]);
+
+    const store = new AuthStore(tmp.dbPath);
+    expect(store.countNpubs()).toBe(1);
+    store.close();
+
+    // The npub still exists, so an unauthenticated claim is refused for the
+    // ordinary reason: no credential, not a claimable empty instance.
+    const res = await proxy.handle(
+      new Request("http://localhost:8008/npubs", {
+        method: "POST",
+        headers: CLAIM_HEADERS,
+        body: JSON.stringify({ pubkey: "ef".repeat(32), name: "Attacker" }),
+      }),
+    );
+    expect(res.status).not.toBe(201);
+    expect(res.status).toBe(401);
+  });
+
+  it("still deletes an explicitly retired pubkey instead of demoting it", async () => {
+    // Demotion must not become a way for a known-compromised admin to survive.
+    const retired = [...RETIRED_ENV_ADMIN_PUBKEYS][0]!;
+    boot([retired, ENV_ADMIN_PUBKEY]);
+    boot([ENV_ADMIN_PUBKEY]);
+
+    const store = new AuthStore(tmp.dbPath);
+    expect(store.hasNpub(retired)).toBe(false);
+    expect(store.hasNpub(ENV_ADMIN_PUBKEY)).toBe(true);
+    store.close();
+  });
+
+  it("takes admin rights away from a pubkey that left the env var", async () => {
+    // Regression guard for dc95d27: removing someone from the variable must
+    // not leave them able to move funds.
+    const secret = generateSecretKey();
+    const pubkey = getPublicKey(secret);
+
+    async function walletSend(): Promise<Response> {
+      const payload = new TextEncoder().encode("{}");
+      const req = new Request("http://localhost:8008/wallet/send/cashu", {
+        method: "POST",
+        body: payload,
+      });
+      const auth = await nip98Authorization(secret, req, payload);
+      return proxy.handle(
+        new Request(req.url, { method: "POST", headers: { Authorization: auth }, body: payload }),
+      );
+    }
+
+    boot([pubkey]);
+    expect((await walletSend()).status).toBe(200);
+
+    boot([]);
+    expect((await walletSend()).status).toBe(403);
+    expect(upstream.calls).toHaveLength(1);
+  });
+
+  it("warns when a retired-from-env npub loses admin and keeps its registration", async () => {
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      boot([ENV_ADMIN_PUBKEY]);
+      warn.mockClear();
+      boot([]);
+      const messages = warn.mock.calls.map((c) => c.join(" ")).join("\n");
+      expect(messages).toContain(nip19.npubEncode(ENV_ADMIN_PUBKEY));
+      expect(messages).toContain("no longer admin");
+      expect(messages).toContain("DELETE /npubs/");
+      expect(messages).toContain("PATCH /npubs");
+      // It was the only admin, so the operator must be told how to get back in.
+      expect(messages).toContain("no admin npub is registered");
+      expect(messages).not.toContain("retire it from there");
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 
