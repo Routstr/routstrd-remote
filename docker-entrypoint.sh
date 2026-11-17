@@ -10,10 +10,13 @@ ROUTSTRD_PORT="${ROUTSTRD_PORT:-${PORT:-8008}}"
 ROUTSTRD_AUTH_PORT="${ROUTSTRD_AUTH_PORT:-8080}"
 ROUTSTRD_AUTH_HOST="${ROUTSTRD_AUTH_HOST:-0.0.0.0}"
 ROUTSTRD_UPSTREAM="${ROUTSTRD_UPSTREAM:-http://localhost:${ROUTSTRD_PORT}}"
-# No default admin npub: unset leaves the npubs table empty so the operator
-# bootstraps the first admin via unauthenticated POST /npubs (or sets the var).
+# No default admin npub: unset leaves the npubs table empty, and the first admin
+# is then claimed with the one-time bootstrap token (generated and logged at
+# startup, or supplied here). An unauthenticated POST /npubs is never accepted.
 ROUTSTRD_AUTH_ADMIN_NPUBS="${ROUTSTRD_AUTH_ADMIN_NPUBS:-}"
-export ROUTSTRD_AUTH_PORT ROUTSTRD_AUTH_HOST ROUTSTRD_UPSTREAM ROUTSTRD_AUTH_ADMIN_NPUBS
+ROUTSTRD_AUTH_BOOTSTRAP_TOKEN="${ROUTSTRD_AUTH_BOOTSTRAP_TOKEN:-}"
+export ROUTSTRD_AUTH_PORT ROUTSTRD_AUTH_HOST ROUTSTRD_UPSTREAM
+export ROUTSTRD_AUTH_ADMIN_NPUBS ROUTSTRD_AUTH_BOOTSTRAP_TOKEN
 
 # Ensure routstrd's config.json has authUrl pointing to the auth proxy and a Nostr identity.
 ROUTSTRD_CONFIG="${ROUTSTRD_DIR}/config.json"

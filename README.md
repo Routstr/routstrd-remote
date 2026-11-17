@@ -27,27 +27,42 @@ All values have sensible defaults and can be overridden via environment variable
 | `ROUTSTRD_UPSTREAM` | `http://localhost:8009` | Upstream routstrd URL |
 | `ROUTSTRD_DB_PATH` | `~/.routstrd/routstr.db` | Shared SQLite DB |
 | `ROUTSTRD_AUTH_MODEL_ALLOWLIST` | `false` | Enable model allowlist enforcement (`true`/`false`) |
+| `ROUTSTRD_AUTH_BOOTSTRAP_TOKEN` | generated | One-time token required to claim the first admin while no npub is registered |
 | `ROUTSTRD_DIR` | `~/.routstrd` | Base config directory |
 
 ## First admin registration
 
-Starting the auth proxy does **not** automatically register the identity in `config.json` as an admin. Register explicitly when you are ready:
+Starting the auth proxy does **not** automatically register the identity in `config.json` as an admin. A fresh instance has no npub at all, so the proxy generates a one-time bootstrap token and prints it at startup. Every claim of the first admin must carry that token.
 
-```bash
-# From inside the container (or its Cloudron terminal)
-routstrd npubs register --name "Alice"
+Copy the token from the app log (Cloudron: the app's **Logs** tab, or `docker logs <container>`):
 
-# Alternatively, from the Docker host
-docker exec -it <container> routstrd npubs register --name "Alice"
+```
+Warning: no registered npub/pubkey. The first admin must be claimed with this one-time token:
+
+    q3Vt...8kQ
+
+  Send it as the x-routstr-bootstrap-token header along with the npub, e.g.:
+    curl -X POST https://<your-app>/npubs -H 'Content-Type: application/json'
+    -H 'x-routstr-bootstrap-token: q3Vt...8kQ'
+    -d '{"npub":"npub1...","name":"Your Name"}'
 ```
 
-A display name is required — it is how the admin list tells identities apart. Omit `--name` on a terminal and the CLI prompts for it; in a script, pass it explicitly. The proxy rejects a registration that carries no name, so if `--name` is not recognised, update the CLI first (`npm i -g routstrd@latest`).
+Then claim it (the first claim becomes an admin by default):
 
-No npub argument is needed: the CLI derives your npub from the `nsec` in its selected `config.json`. Inside the container this uses the container identity; on another machine it uses that machine's configured identity and auth URL.
+```bash
+curl -X POST "$AUTH_URL/npubs" \
+  -H 'Content-Type: application/json' \
+  -H 'x-routstr-bootstrap-token: <token from the log>' \
+  -d '{"npub":"npub1...","name":"Alice"}'
+```
 
-When no npubs are registered, `GET /npubs` accepts a valid NIP-98 request so the CLI can check the empty list before registering. The first `POST /npubs` is unauthenticated and defaults to admin; later additions require an existing admin. This bootstrap is **not container-only**: anyone who can reach the endpoint can claim the first-admin slot while the store is empty. Restrict access until registration is complete.
+The token is **single-use**: the first successful claim voids it, and the window closes for good once any npub exists. A rejected claim (bad JSON, missing `name`) does not void it. Set `ROUTSTRD_AUTH_BOOTSTRAP_TOKEN` yourself to choose the value instead; it is then not printed to the log.
 
-If an admin is already configured (including via `ROUTSTRD_AUTH_ADMIN_*`), use that admin to add other identities with `routstrd npubs add <npub>`.
+Without this, the window would be open to the internet: the app is publicly reachable the moment Cloudron finishes installing it, and the first admin can send wallet funds and read every provider credential. The token is what makes "install now, configure later" safe.
+
+`routstrd npubs register` does not send this header, so the *first* admin is claimed with the `curl` above. Once an npub is registered, `GET /npubs` and `POST /npubs` go back to NIP-98 from an existing admin and the CLI works as before.
+
+If you delete every npub, the table is empty again and the proxy starts a new instance with no token (it only mints one while there is a window to protect). Restart the app to mint and log a new token, or set `ROUTSTRD_AUTH_BOOTSTRAP_TOKEN` and restart.
 
 ## Cloudron
 
@@ -59,14 +74,18 @@ If an admin is already configured (including via `ROUTSTRD_AUTH_ADMIN_*`), use t
 # Install the CLI client globally
 bun i -g routstrd
 
-# Connect to your Cloudron instance
+# Connect to your Cloudron instance (this prints your npub)
 routstrd remote <cloudron-url>
 
-# Register yourself as the first admin (first npub gets admin by default)
-routstrd npubs register --name "Alice"
+# Register yourself as the first admin. This one step uses curl because the
+# CLI does not send the bootstrap token; copy the token from the app's Logs tab.
+curl -X POST "https://<cloudron-url>/npubs" \
+  -H 'Content-Type: application/json' \
+  -H 'x-routstr-bootstrap-token: <token from the app log>' \
+  -d '{"npub":"<your npub>","name":"Alice"}'
 ```
 
-That's it — you now have full access to routstrd on Cloudron. Integrate it with your coding agents:
+The first npub registered this way gets `admin` by default. After that, `routstrd npubs list`, `add` and `update` work from the CLI as usual.
 
 ```bash
 routstrd clients add --pi-agent    # for Pi Agent
@@ -285,7 +304,8 @@ The helper creates `Authorization: Nostr <base64-event>` headers whose signed ev
   - provider API-key listing and deletion
 - **Registered npubs** — stored in the shared `routstr.db` table `routstr_auth_npubs`. Env-configured admins are bootstrapped into that table at startup.
 - **List npubs** — `GET /npubs` returns `{ "npubs": [...] }` with each npub's `npub`, `name`, `role`, `monthlyLimitSats` (`null` = unlimited), plus a top-level `monthlyResetAt` (Unix seconds). Admins also get every npub's `monthlyUsedSats`; a member only gets their own. Requires NIP-98 auth from a registered npub.
-- **Add npubs** — `POST /npubs` with `{ "npub": "npub1..." }` or `{ "pubkey": "<64-char hex>" }`, optionally `{ "role": "user", "name": "Alice", "monthlyLimitSats": 5000 }`. If no npubs are configured yet, this first add is unauthenticated; after that it requires NIP-98 auth from an existing admin. Duplicate npubs return `409`; use `PATCH /npubs` to update an existing entry.
+- **Add npubs** — `POST /npubs` with `{ "npub": "npub1..." }` or `{ "pubkey": "<64-char hex>" }`, optionally `{ "role": "user", "name": "Alice", "monthlyLimitSats": 5000 }`. If no npubs are configured yet, this first add requires the one-time bootstrap token in the `x-routstr-bootstrap-token` header (see [First admin registration](#first-admin-registration)); after that it requires NIP-98 auth from an existing admin. Duplicate npubs return `409`; use `PATCH /npubs` to update an existing entry.
+- **Body limits** — the npub and client management routes accept at most 1 MiB of JSON and answer `413` beyond that. Credentials are checked before the body is read, so an unauthenticated caller cannot make the proxy buffer a payload.
 - **Update npubs** — `PATCH /npubs` with `{ "npub": "npub1..." }` or `{ "pubkey": "<64-char hex>" }` plus `role`, `name` and/or `monthlyLimitSats`. Requires NIP-98 auth from an existing admin. Set `name` to `null` to clear it and `monthlyLimitSats` to `null` to remove the monthly cap.
 - **Monthly spend cap** — paid requests are checked against the npub's cap and return `402` with `code: "monthly_quota_exceeded"` and `X-Routstr-Quota-*` headers once it is reached. See [Monthly spend limits per npub](#monthly-spend-limits-per-npub).
 - **Remove npubs** — `DELETE /npubs/<npub-or-pubkey>` (or `DELETE /npubs?npub=...`) requires NIP-98 auth from an existing admin.

@@ -112,6 +112,13 @@ export interface AuthProxyConfig {
   invalidAdminPubkeys: string[];
   /** Whether model allowlist enforcement is enabled. */
   modelAllowlistEnabled: boolean;
+  /**
+   * One-time token that authorises the first-admin bootstrap while the npub
+   * table is empty. `null` means "generate one at startup" (and log it), which
+   * is what happens when the operator does not set
+   * `ROUTSTRD_AUTH_BOOTSTRAP_TOKEN`.
+   */
+  bootstrapToken: string | null;
 }
 
 /**
@@ -129,6 +136,7 @@ export function loadConfig(): AuthProxyConfig {
     adminPubkeys: adminPubkeys.pubkeys,
     invalidAdminPubkeys: adminPubkeys.invalid,
     modelAllowlistEnabled: MODEL_ALLOWLIST_ENABLED,
+    bootstrapToken: process.env.ROUTSTRD_AUTH_BOOTSTRAP_TOKEN || null,
   };
 
   return config;
