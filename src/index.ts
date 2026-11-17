@@ -8,6 +8,19 @@ program
   .description("Auth proxy for routstrd — validates Bearer tokens or NIP-98 Nostr auth and forwards requests")
   .version("0.1.0");
 
+/**
+ * A malformed environment variable should read as a one-line configuration
+ * error, not as a stack trace from somewhere inside the proxy.
+ */
+function loadConfigOrExit(): ReturnType<typeof loadConfig> {
+  try {
+    return loadConfig();
+  } catch (error) {
+    console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(1);
+  }
+}
+
 program
   .command("start")
   .description("Start the auth proxy")
@@ -16,7 +29,7 @@ program
   .option("-u, --upstream <url>", "Upstream routstrd URL")
   .option("-d, --db-path <path>", "Path to shared SQLite DB")
   .action((opts) => {
-    const cfg = loadConfig();
+    const cfg = loadConfigOrExit();
     if (opts.port) cfg.port = opts.port;
     if (opts.host) cfg.host = opts.host;
     if (opts.upstream) cfg.upstream = opts.upstream;
@@ -37,7 +50,7 @@ program
   .description("Validate configuration and check DB connectivity")
   .option("-d, --db-path <path>", "Path to shared SQLite DB")
   .action((opts) => {
-    const cfg = loadConfig();
+    const cfg = loadConfigOrExit();
     if (opts.dbPath) cfg.dbPath = opts.dbPath;
 
     console.log("Configuration:");
@@ -47,6 +60,7 @@ program
     console.log(`  DB path:  ${cfg.dbPath}`);
     console.log(`  Bootstrap admin npubs/pubkeys from env: ${cfg.adminPubkeys.length}`);
     console.log(`  Model allowlist: ${cfg.modelAllowlistEnabled ? "enabled" : "disabled"}`);
+    console.log(`  NIP-98 URL binding: ${cfg.publicUrl ?? "(request headers)"}`);
 
     const err = validateConfig(cfg);
     if (err) {

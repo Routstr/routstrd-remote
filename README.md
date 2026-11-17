@@ -27,27 +27,44 @@ All values have sensible defaults and can be overridden via environment variable
 | `ROUTSTRD_UPSTREAM` | `http://localhost:8009` | Upstream routstrd URL |
 | `ROUTSTRD_DB_PATH` | `~/.routstrd/routstr.db` | Shared SQLite DB |
 | `ROUTSTRD_AUTH_MODEL_ALLOWLIST` | `false` | Enable model allowlist enforcement (`true`/`false`) |
+| `ROUTSTRD_AUTH_PUBLIC_URL` | `CLOUDRON_APP_ORIGIN`, then request headers | Origin NIP-98 signatures must bind to, e.g. `https://routstr.example.com` |
+| `ROUTSTRD_AUTH_REPLAY_CACHE_MAX` | `16384` | Maximum retained NIP-98 IDs per proxy (1–1000000); fails closed when full |
+| `ROUTSTRD_AUTH_BOOTSTRAP_TOKEN` | generated | One-time token required to claim the first admin while no npub is registered |
 | `ROUTSTRD_DIR` | `~/.routstrd` | Base config directory |
 
 ## First admin registration
 
-Starting the auth proxy does **not** automatically register the identity in `config.json` as an admin. Register explicitly when you are ready:
+Starting the auth proxy does **not** automatically register the identity in `config.json` as an admin. A fresh instance has no npub at all, so the proxy generates a one-time bootstrap token and prints it at startup. Every claim of the first admin must carry that token.
 
-```bash
-# From inside the container (or its Cloudron terminal)
-routstrd npubs register --name "Alice"
+Copy the token from the app log (Cloudron: the app's **Logs** tab, or `docker logs <container>`):
 
-# Alternatively, from the Docker host
-docker exec -it <container> routstrd npubs register --name "Alice"
+```
+Warning: no registered npub/pubkey. The first admin must be claimed with this one-time token:
+
+    q3Vt...8kQ
+
+  Send it as the x-routstr-bootstrap-token header along with the npub, e.g.:
+    curl -X POST https://<your-app>/npubs -H 'Content-Type: application/json'
+    -H 'x-routstr-bootstrap-token: q3Vt...8kQ'
+    -d '{"npub":"npub1...","name":"Your Name"}'
 ```
 
-A display name is required — it is how the admin list tells identities apart. Omit `--name` on a terminal and the CLI prompts for it; in a script, pass it explicitly. The proxy rejects a registration that carries no name, so if `--name` is not recognised, update the CLI first (`npm i -g routstrd@latest`).
+Then claim it (the first claim becomes an admin by default):
 
-No npub argument is needed: the CLI derives your npub from the `nsec` in its selected `config.json`. Inside the container this uses the container identity; on another machine it uses that machine's configured identity and auth URL.
+```bash
+curl -X POST "$AUTH_URL/npubs" \
+  -H 'Content-Type: application/json' \
+  -H 'x-routstr-bootstrap-token: <token from the log>' \
+  -d '{"npub":"npub1...","name":"Alice"}'
+```
 
-When no npubs are registered, `GET /npubs` accepts a valid NIP-98 request so the CLI can check the empty list before registering. The first `POST /npubs` is unauthenticated and defaults to admin; later additions require an existing admin. This bootstrap is **not container-only**: anyone who can reach the endpoint can claim the first-admin slot while the store is empty. Restrict access until registration is complete.
+The token is **single-use**: the first successful claim voids it, and the window closes for good once any npub exists. A rejected claim (bad JSON, missing `name`) does not void it. Set `ROUTSTRD_AUTH_BOOTSTRAP_TOKEN` yourself to choose the value instead; it is then not printed to the log.
 
-If an admin is already configured (including via `ROUTSTRD_AUTH_ADMIN_*`), use that admin to add other identities with `routstrd npubs add <npub>`.
+Without this, the window would be open to the internet: the app is publicly reachable the moment Cloudron finishes installing it, and the first admin can send wallet funds and read every provider credential. The token is what makes "install now, configure later" safe.
+
+`routstrd npubs register` does not send this header, so the *first* admin is claimed with the `curl` above. Once an npub is registered, `GET /npubs` and `POST /npubs` go back to NIP-98 from an existing admin and the CLI works as before.
+
+If you delete every npub, the table is empty again and the proxy starts a new instance with no token (it only mints one while there is a window to protect). Restart the app to mint and log a new token, or set `ROUTSTRD_AUTH_BOOTSTRAP_TOKEN` and restart.
 
 ## Cloudron
 
@@ -59,14 +76,18 @@ If an admin is already configured (including via `ROUTSTRD_AUTH_ADMIN_*`), use t
 # Install the CLI client globally
 bun i -g routstrd
 
-# Connect to your Cloudron instance
+# Connect to your Cloudron instance (this prints your npub)
 routstrd remote <cloudron-url>
 
-# Register yourself as the first admin (first npub gets admin by default)
-routstrd npubs register --name "Alice"
+# Register yourself as the first admin. This one step uses curl because the
+# CLI does not send the bootstrap token; copy the token from the app's Logs tab.
+curl -X POST "https://<cloudron-url>/npubs" \
+  -H 'Content-Type: application/json' \
+  -H 'x-routstr-bootstrap-token: <token from the app log>' \
+  -d '{"npub":"<your npub>","name":"Alice"}'
 ```
 
-That's it — you now have full access to routstrd on Cloudron. Integrate it with your coding agents:
+The first npub registered this way gets `admin` by default. After that, `routstrd npubs list`, `add` and `update` work from the CLI as usual.
 
 ```bash
 routstrd clients add --pi-agent    # for Pi Agent
@@ -283,14 +304,18 @@ The helper creates `Authorization: Nostr <base64-event>` headers whose signed ev
   - anything that moves value: `POST /wallet/send/cashu`, `/wallet/send/bolt11`, `/wallet/sweep-offline`, `/wallet/send/cashu/<id>/mark-spent`, `/wallet/recover`, `/wallet/recover/operations`
   - wallet integrity: `POST /wallet/unlock`, `/wallet/cleanup`, `/wallet/check-proofs`, and the mint setters `POST /wallet/mints` and `/wallet/mints/default` (the `GET` reads and `/wallet/mints/info` stay open to any registered npub). `check-proofs` is not a read despite the name: it marks mint-reported proofs spent, which reclaims balance and finalizes reserved sends
   - provider API-key listing and deletion
-- **Registered npubs** — stored in the shared `routstr.db` table `routstr_auth_npubs`. Env-configured admins are bootstrapped into that table at startup.
+- **Registered npubs** — stored in the shared `routstr.db` table `routstr_auth_npubs`. Env-configured admins are bootstrapped into that table at startup. Removing a pubkey from `ROUTSTRD_AUTH_ADMIN_NPUBS` **takes admin away but keeps the registration**: on the next start the row becomes an ordinary `user` (`source` flips from `env` to `api`, name and monthly limit are kept), so the npub's existing API keys keep working and the npub table never empties out and re-opens the first-admin bootstrap. A startup warning names every npub this happened to. To revoke the npub completely, use `DELETE /npubs/<npub>`; to keep it as an admin managed in the database, `PATCH /npubs` it with `role: "admin"`. Listing a pubkey in the variable always makes it an env-managed admin, even if it was registered through the API before. The exception is a pubkey on the retirement list in `src/store.ts`, which is deleted outright — that list exists for known-compromised admins such as the default `docker-entrypoint.sh` used to ship, and adding to it is a permanent, deliberate act.
 - **List npubs** — `GET /npubs` returns `{ "npubs": [...] }` with each npub's `npub`, `name`, `role`, `monthlyLimitSats` (`null` = unlimited), plus a top-level `monthlyResetAt` (Unix seconds). Admins also get every npub's `monthlyUsedSats`; a member only gets their own. Requires NIP-98 auth from a registered npub.
-- **Add npubs** — `POST /npubs` with `{ "npub": "npub1..." }` or `{ "pubkey": "<64-char hex>" }`, optionally `{ "role": "user", "name": "Alice", "monthlyLimitSats": 5000 }`. If no npubs are configured yet, this first add is unauthenticated; after that it requires NIP-98 auth from an existing admin. Duplicate npubs return `409`; use `PATCH /npubs` to update an existing entry.
+- **Add npubs** — `POST /npubs` with `{ "npub": "npub1..." }` or `{ "pubkey": "<64-char hex>" }`, optionally `{ "role": "user", "name": "Alice", "monthlyLimitSats": 5000 }`. If no npubs are configured yet, this first add requires the one-time bootstrap token in the `x-routstr-bootstrap-token` header (see [First admin registration](#first-admin-registration)); after that it requires NIP-98 auth from an existing admin. Duplicate npubs return `409`; use `PATCH /npubs` to update an existing entry.
+- **Body limits** — the npub and client management routes accept at most 1 MiB of JSON and answer `413` beyond that. Credentials are checked before the body is read, so an unauthenticated caller cannot make the proxy buffer a payload.
 - **Update npubs** — `PATCH /npubs` with `{ "npub": "npub1..." }` or `{ "pubkey": "<64-char hex>" }` plus `role`, `name` and/or `monthlyLimitSats`. Requires NIP-98 auth from an existing admin. Set `name` to `null` to clear it and `monthlyLimitSats` to `null` to remove the monthly cap.
 - **Monthly spend cap** — paid requests are checked against the npub's cap and return `402` with `code: "monthly_quota_exceeded"` and `X-Routstr-Quota-*` headers once it is reached. See [Monthly spend limits per npub](#monthly-spend-limits-per-npub).
-- **Remove npubs** — `DELETE /npubs/<npub-or-pubkey>` (or `DELETE /npubs?npub=...`) requires NIP-98 auth from an existing admin. The last admin cannot be removed or demoted (`409`, `code: "last_admin"`): with no admin left nobody can add an npub, and an empty table is the state that allows first-admin bootstrap. Add another admin first.
+- **Remove npubs** — `DELETE /npubs/<npub-or-pubkey>` (or `DELETE /npubs?npub=...`) requires NIP-98 auth from an existing admin. Removal takes effect on the next request: every API key whose recorded owner is that npub is refused with `403` and `code: "client_owner_not_registered"` until the npub is registered again, so removing a member also stops the clients they already created. The keys themselves stay in the daemon's storage. Clients created before owner attribution existed record no owner and are unaffected, because the id suffix is the only signal they carry; the proxy warns at startup about keys whose recorded owner is missing. The last admin cannot be removed or demoted (`409`, `code: "last_admin"`): with no admin left nobody can add an npub, so the instance has to be recovered out-of-band. Add another admin first.
 - **Forwarded headers** — the proxy strips `Authorization` and injects `x-routstr-client-id` so the daemon knows which client made the request.
-- **Replay** — a NIP-98 event id is remembered for the period it could still be accepted (just over two minutes, twice the freshness window) and a second presentation is refused, so a captured request cannot be replayed.
+- **NIP-98 URL binding** — the `u` tag must match the public URL of the request. Set `ROUTSTRD_AUTH_PUBLIC_URL` (e.g. `https://routstr.example.com`) to bind to a fixed origin. Only an HTTP(S) origin is accepted: no credentials, non-root path, query, or fragment. On Cloudron, `CLOUDRON_APP_ORIGIN` is used automatically when this override is unset or blank. If neither is set, the proxy derives the URL from the request's `Host` / `x-forwarded-*` headers, which the caller supplies, so a deployment that does not sit behind a proxy which overwrites them can have events signed for another host replayed here. The startup log says which mode is in effect.
+- **Replay** — authenticated NIP-98 events are single-use. Sign a fresh event with a random `nonce` tag for **every request**, including identical requests within the same second. Duplicate IDs return `401`, `code: "nip98_replayed"`. Events are recorded only after registration and role checks, before executing the action; later failures still consume the event. The read-only empty-table bootstrap `GET /npubs` is exempt. Each proxy keeps its own in-memory cache: protection does not survive restarts or span instances. IDs are retained for 125 seconds, never evicted early. At capacity, new events return `503`, `code: "replay_cache_saturated"`, with `Retry-After`; saturation warnings are limited to once per minute. Expired IDs are removed lazily on the next authorized request. Logical authentication time never moves backwards: after a clock rollback it waits for wall time to catch up, and a forward jump permanently invalidates older events within that proxy instance. Correct a bad clock before restarting; restarts lose replay history.
+- **Replay capacity** — `ROUTSTRD_AUTH_REPLAY_CACHE_MAX` accepts integers 1–1000000 (default 16384). This initial policy accommodates about 131 accepted requests/second sustained over the 125-second retention period, not a measured traffic guarantee. Size it for your peak traffic; authorized members share the global budget. Replay protection is not payment idempotency: automatically re-signing/retrying a money-moving request after a lost response can execute it twice.
+- **Release prerequisite** — ship the routstrd signer nonce fix (`9a60f13`, NGIT PR linked in `NIP98.md`) in the bundled daemon before releasing this replay guard. The signer PR is not a released dependency yet; no bundled version is changed here. Older clients without unique event tags can receive false replay refusals for identical same-second requests. Unknown tags remain accepted; the server does not require a particular nonce tag.
 
 ## License
 

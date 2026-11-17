@@ -1,3 +1,4 @@
+import { parseReplayCacheMax } from "./replay-cache";
 import { join } from "path";
 import { existsSync } from "fs";
 import { nip19 } from "nostr-tools";
@@ -112,6 +113,56 @@ export interface AuthProxyConfig {
   invalidAdminPubkeys: string[];
   /** Whether model allowlist enforcement is enabled. */
   modelAllowlistEnabled: boolean;
+  /**
+   * Public origin NIP-98 events must have signed (`ROUTSTRD_AUTH_PUBLIC_URL`,
+   * falling back to `CLOUDRON_APP_ORIGIN`),
+   * e.g. `https://routstr.example.com`. When null the proxy falls back to the
+   * request's own URL plus `x-forwarded-*` headers, which the caller controls.
+   */
+  publicUrl: string | null;
+  /** Maximum live NIP-98 event IDs retained by each proxy. */
+  replayCacheMax?: number;
+  /**
+   * One-time token that authorises the first-admin bootstrap while the npub
+   * table is empty. `null` means "generate one at startup" (and log it), which
+   * is what happens when the operator does not set
+   * `ROUTSTRD_AUTH_BOOTSTRAP_TOKEN`.
+   */
+  bootstrapToken: string | null;
+}
+
+/**
+ * Normalise `ROUTSTRD_AUTH_PUBLIC_URL` to an origin with no trailing slash, and
+ * reject anything that is not an absolute http(s) URL so a typo fails loudly
+ * instead of silently binding NIP-98 to a bogus string.
+ */
+export function normalizePublicUrl(value: string | undefined): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed) return null;
+
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    throw new Error(
+      `Invalid public URL (ROUTSTRD_AUTH_PUBLIC_URL or CLOUDRON_APP_ORIGIN). Expected an absolute URL such as https://routstr.example.com.`,
+    );
+  }
+
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new Error(
+      `Invalid public URL (ROUTSTRD_AUTH_PUBLIC_URL or CLOUDRON_APP_ORIGIN). Expected http or https.`,
+    );
+  }
+
+  if (url.username || url.password || url.pathname !== "/" ||
+      trimmed.includes("?") || trimmed.includes("#")) {
+    throw new Error(
+      "Invalid public URL (ROUTSTRD_AUTH_PUBLIC_URL or CLOUDRON_APP_ORIGIN): " +
+        "expected an origin without credentials, a non-root path, query, or fragment.",
+    );
+  }
+  return url.origin;
 }
 
 /**
@@ -129,6 +180,11 @@ export function loadConfig(): AuthProxyConfig {
     adminPubkeys: adminPubkeys.pubkeys,
     invalidAdminPubkeys: adminPubkeys.invalid,
     modelAllowlistEnabled: MODEL_ALLOWLIST_ENABLED,
+    replayCacheMax: parseReplayCacheMax(process.env.ROUTSTRD_AUTH_REPLAY_CACHE_MAX),
+    bootstrapToken: process.env.ROUTSTRD_AUTH_BOOTSTRAP_TOKEN || null,
+    publicUrl: normalizePublicUrl(
+      process.env.ROUTSTRD_AUTH_PUBLIC_URL?.trim() || process.env.CLOUDRON_APP_ORIGIN,
+    ),
   };
 
   return config;
