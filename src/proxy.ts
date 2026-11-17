@@ -1072,6 +1072,23 @@ export class AuthProxy {
       this.holdConnectionOpen(ctx, req);
 
       const clientNpub = this.resolveClientNpub(client);
+      if (client.ownerNpub && !clientNpub) {
+        // Removing an npub is the operation an operator reaches for to cut
+        // someone off. The key itself lives in the daemon's storage and keeps
+        // authenticating, so the only place access actually stops is here: a
+        // key whose recorded owner is no longer registered is refused.
+        //
+        // Clients created before `ownerNpub` existed carry no owner and are
+        // still attributed by the npub suffix, so they are unaffected -- the
+        // suffix is the only signal they have.
+        return this.json({
+          error:
+            "This API key belongs to an npub that is no longer registered, so it no longer works. " +
+            "Ask an admin to register the npub again, or create a new client with " +
+            "'routstrd clients add'.",
+          code: "client_owner_not_registered",
+        }, 403);
+      }
       if (clientNpub) {
         const blocked = this.quotaResponse(clientNpub, req);
         if (blocked) return blocked;
@@ -1173,6 +1190,23 @@ export class AuthProxy {
           "They were bootstrapped from ROUTSTRD_AUTH_ADMIN_* or migrated from the " +
           "legacy admin table. Set one with: routstrd npubs update <npub> --name \"Alice\"",
       );
+    }
+
+    // Keys whose owner was removed keep sitting in the daemon's storage. They
+    // are refused at the proxy now, so name them at startup rather than letting
+    // people find out from a 403 in the middle of a request.
+    if (npubCount > 0) {
+      const orphaned = this.store
+        .getClients()
+        .filter((c) => c.ownerNpub && !this.resolveClientNpub(c));
+      if (orphaned.length > 0) {
+        const shown = orphaned.slice(0, 5).map((c) => c.clientId).join(", ");
+        const more = orphaned.length > 5 ? ` (+${orphaned.length - 5} more)` : "";
+        console.warn(
+          `  Warning: ${orphaned.length} API key(s) belong to an npub that is not registered and will be refused: ${shown}${more}. ` +
+            "Re-create them with 'routstrd clients add'.",
+        );
+      }
     }
 
     Bun.serve({
