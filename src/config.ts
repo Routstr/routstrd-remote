@@ -113,7 +113,8 @@ export interface AuthProxyConfig {
   /** Whether model allowlist enforcement is enabled. */
   modelAllowlistEnabled: boolean;
   /**
-   * Public origin NIP-98 events must have signed (`ROUTSTRD_AUTH_PUBLIC_URL`),
+   * Public origin NIP-98 events must have signed (`ROUTSTRD_AUTH_PUBLIC_URL`,
+   * falling back to `CLOUDRON_APP_ORIGIN`),
    * e.g. `https://routstr.example.com`. When null the proxy falls back to the
    * request's own URL plus `x-forwarded-*` headers, which the caller controls.
    */
@@ -162,7 +163,9 @@ export function loadConfig(): AuthProxyConfig {
     adminPubkeys: adminPubkeys.pubkeys,
     invalidAdminPubkeys: adminPubkeys.invalid,
     modelAllowlistEnabled: MODEL_ALLOWLIST_ENABLED,
-    publicUrl: normalizePublicUrl(process.env.ROUTSTRD_AUTH_PUBLIC_URL),
+    publicUrl: normalizePublicUrl(
+      process.env.ROUTSTRD_AUTH_PUBLIC_URL?.trim() || process.env.CLOUDRON_APP_ORIGIN,
+    ),
   };
 
   return config;

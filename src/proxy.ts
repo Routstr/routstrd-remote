@@ -948,10 +948,10 @@ export class AuthProxy {
     console.log(`  Registered npubs: ${npubCount}`);
     console.log(`  Model allowlist: ${this.config.modelAllowlistEnabled ? "enabled" : "disabled"}`);
     if (this.config.publicUrl) {
-      console.log(`  NIP-98 URL binding: ${this.config.publicUrl} (ROUTSTRD_AUTH_PUBLIC_URL)`);
+      console.log(`  NIP-98 URL binding: ${this.config.publicUrl} (ROUTSTRD_AUTH_PUBLIC_URL or CLOUDRON_APP_ORIGIN)`);
     } else {
       console.warn(
-        "  Warning: ROUTSTRD_AUTH_PUBLIC_URL is not set. NIP-98 requests are bound to the " +
+        "  Warning: neither ROUTSTRD_AUTH_PUBLIC_URL nor CLOUDRON_APP_ORIGIN is set. NIP-98 requests are bound to the " +
           "URL implied by the request's Host / x-forwarded-* headers, which the caller " +
           "supplies. Set it to the app's public URL unless a proxy in front overwrites them.",
       );

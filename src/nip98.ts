@@ -44,7 +44,7 @@ function firstHeaderValue(value: string | null): string | null {
 /**
  * The URL a NIP-98 event must have signed.
  *
- * `ROUTSTRD_AUTH_PUBLIC_URL` wins when it is set: the signed `u` tag then binds
+ * The configured public URL (explicit override or Cloudron origin) wins: the signed `u` tag then binds
  * to a value the operator controls, and the forwarding headers below are not
  * consulted at all. Without it we fall back to the request's own URL, patched
  * with `x-forwarded-*` so deployments behind TLS/load-balancers can validate
@@ -53,7 +53,7 @@ function firstHeaderValue(value: string | null): string | null {
  * That fallback trusts headers the caller supplies. A proxy that appends rather
  * than replaces them (or direct access to the app port) lets a caller present
  * any host it likes, which defeats the binding and turns a NIP-98 event signed
- * for some other service into a credential here. Set the variable wherever the
+ * for some other service into a credential here. Configure a public URL wherever the
  * proxy does not overwrite these headers itself.
  */
 function getAbsoluteRequestUrl(req: Request, publicUrl?: string | null): string {
