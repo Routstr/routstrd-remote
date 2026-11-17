@@ -42,10 +42,9 @@ describe("AuthStore env admin reconciliation", () => {
   });
 
   it("demotes env-sourced npubs that are no longer in the env var", () => {
-    // A pubkey leaving the variable is a configuration change, not a
-    // revocation: it must survive as an ordinary registration so its API keys
-    // keep working and the npub table never empties out from under the
-    // bootstrap guard.
+    // A pubkey leaving the variable loses admin (dc95d27) but stays registered
+    // as a user, so its API keys keep working and the npub table never empties
+    // out from under the bootstrap guard.
     const dbPath = tmpDbPath();
     new AuthStore(dbPath, [ENV_ADMIN_A, ENV_ADMIN_B]).close();
 
@@ -53,7 +52,9 @@ describe("AuthStore env admin reconciliation", () => {
     expect(store.hasNpub(ENV_ADMIN_A)).toBe(true);
     expect(store.hasNpub(ENV_ADMIN_B)).toBe(true);
     expect(store.getNpubByPubkey(ENV_ADMIN_A)?.source).toBe("env");
+    expect(store.getNpubByPubkey(ENV_ADMIN_A)?.role).toBe("admin");
     expect(store.getNpubByPubkey(ENV_ADMIN_B)?.source).toBe("api");
+    expect(store.getNpubByPubkey(ENV_ADMIN_B)?.role).toBe("user");
     store.close();
   });
 
@@ -69,16 +70,66 @@ describe("AuthStore env admin reconciliation", () => {
     store.close();
   });
 
-  it("keeps the role and name of a demoted env admin", () => {
+  it("revokes admin from a demoted env admin but keeps its name and limit", () => {
+    // Regression guard for dc95d27: leaving the variable must not leave the
+    // pubkey an admin, or removing someone from it would grant admin forever.
     const dbPath = tmpDbPath();
     const first = new AuthStore(dbPath, [ENV_ADMIN_A]);
-    first.addNpub(API_NPUB, "user", ENV_ADMIN_A, "Alice");
+    first.updateNpub(ENV_ADMIN_A, { name: "Ops", monthlyLimitSats: 500 });
     first.close();
 
     const store = new AuthStore(dbPath, []);
-    expect(store.getNpubByPubkey(ENV_ADMIN_A)?.role).toBe("admin");
-    expect(store.getNpubByPubkey(API_NPUB)?.role).toBe("user");
+    const entry = store.getNpubByPubkey(ENV_ADMIN_A);
+    expect(entry?.role).toBe("user");
+    expect(store.hasNpubRole(ENV_ADMIN_A, "admin")).toBe(false);
+    expect(entry?.name).toBe("Ops");
+    expect(entry?.monthlyLimitSats).toBe(500);
+    store.close();
+  });
+
+  it("does not touch the role of npubs registered via the API", () => {
+    const dbPath = tmpDbPath();
+    const first = new AuthStore(dbPath, [ENV_ADMIN_A]);
+    first.addNpub(API_NPUB, "admin", ENV_ADMIN_A, "Alice");
+    first.close();
+
+    const store = new AuthStore(dbPath, []);
+    expect(store.getNpubByPubkey(API_NPUB)?.role).toBe("admin");
     expect(store.getNpubByPubkey(API_NPUB)?.name).toBe("Alice");
+    store.close();
+  });
+
+  it("an env admin promoted to admin via the API after demotion stays admin", () => {
+    // The documented way to keep a retired env admin: PATCH role=admin. The row
+    // is source='api' by then, so the next reconcile leaves it alone.
+    const dbPath = tmpDbPath();
+    new AuthStore(dbPath, [ENV_ADMIN_A]).close();
+    const second = new AuthStore(dbPath, []);
+    second.updateNpub(ENV_ADMIN_A, { role: "admin" });
+    second.close();
+
+    const store = new AuthStore(dbPath, []);
+    expect(store.getNpubByPubkey(ENV_ADMIN_A)?.role).toBe("admin");
+    expect(store.getNpubByPubkey(ENV_ADMIN_A)?.source).toBe("api");
+    store.close();
+  });
+
+  it("listing an API-registered user in the env var makes it an env admin", () => {
+    // INSERT OR IGNORE alone would keep the existing row's source and role.
+    const dbPath = tmpDbPath();
+    const first = new AuthStore(dbPath, []);
+    first.addNpub(API_NPUB, "user", null, "Bob");
+    first.close();
+
+    const second = new AuthStore(dbPath, [API_NPUB]);
+    expect(second.getNpubByPubkey(API_NPUB)?.role).toBe("admin");
+    expect(second.getNpubByPubkey(API_NPUB)?.source).toBe("env");
+    expect(second.getNpubByPubkey(API_NPUB)?.name).toBe("Bob");
+    second.close();
+
+    // ...and leaving the variable again demotes it like any other env admin.
+    const store = new AuthStore(dbPath, []);
+    expect(store.getNpubByPubkey(API_NPUB)?.role).toBe("user");
     store.close();
   });
 
@@ -114,6 +165,7 @@ describe("AuthStore env admin reconciliation", () => {
     const store = new AuthStore(dbPath, []);
     expect(store.hasNpub(ENV_ADMIN_A)).toBe(true);
     expect(store.getNpubByPubkey(ENV_ADMIN_A)?.source).toBe("api");
+    expect(store.getNpubByPubkey(ENV_ADMIN_A)?.role).toBe("user");
     const apiEntry = store.getNpubByPubkey(API_NPUB);
     expect(apiEntry?.source).toBe("api");
     expect(apiEntry?.role).toBe("user");

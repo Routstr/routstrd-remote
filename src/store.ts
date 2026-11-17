@@ -147,9 +147,17 @@ export class AuthStore {
   }
 
   /**
-   * Bootstrap env-provided admin pubkeys and delete `source='env'` rows no
-   * longer present in the env — otherwise removing a pubkey from the variable
-   * would leave it admin forever. `source='api'` rows are never touched.
+   * Make the npub table agree with `ROUTSTRD_AUTH_ADMIN_NPUBS`.
+   *
+   * - A pubkey in the variable is an env-managed admin: inserted if missing,
+   *   otherwise re-stamped to `source='env', role='admin'`.
+   * - A pubkey that left the variable loses admin (otherwise removing it would
+   *   leave it admin forever, see dc95d27) but stays registered as a `user`, so
+   *   its API keys keep working and the table cannot empty out underneath the
+   *   first-admin bootstrap guard.
+   * - A pubkey on `RETIRED_ENV_ADMIN_PUBKEYS` is deleted outright.
+   *
+   * Rows that were never env-managed (`source='api'`) are not touched.
    */
   private reconcileEnvAdminPubkeys(pubkeys: string[]): void {
     const uniquePubkeys = [...new Set(pubkeys.map((p) => p.toLowerCase()))];
@@ -167,15 +175,16 @@ export class AuthStore {
         insert.run(pubkey, nip19.npubEncode(pubkey), now);
       }
 
-      // Rows still listed in the env var are env-managed, so pin them to
-      // `source = 'env'`. Without this, an operator who also added the npub
-      // through `POST /npubs` keeps an `api` row (addNpub is INSERT OR IGNORE,
-      // so it silently reports added: false and the row keeps source='env'
-      // anyway) and the two views of the same npub disagree about who owns it.
-      // The env var is the ground truth for "is this env-managed?", not
-      // whatever a row happens to say.
+      // Rows still listed in the env var are env-managed admins, whatever the
+      // row currently says. INSERT OR IGNORE above leaves an existing row alone,
+      // so without this a pubkey that was registered through `POST /npubs`
+      // (possibly as a `user`) and is then listed in the variable would keep
+      // its old source and role: the variable would not grant admin, and the
+      // row would not be recognised as env-managed when it later leaves the
+      // variable. The env var is the ground truth for both.
       const markEnv = this.db.prepare(
-        "UPDATE routstr_auth_npubs SET source = 'env' WHERE pubkey = ? AND source != 'env'",
+        "UPDATE routstr_auth_npubs SET source = 'env', role = 'admin' " +
+          "WHERE pubkey = ? AND (source != 'env' OR role != 'admin')",
       );
       for (const pubkey of uniquePubkeys) {
         markEnv.run(pubkey);
@@ -195,23 +204,24 @@ export class AuthStore {
       //      reason reconcile deletes at all -- it is how the hardcoded default
       //      admin was purged in dc95d27 -- and it has to keep working.
       //
-      //   2. The operator moved admin configuration from the env var into the
-      //      database, re-typed the variable, or rolled back a deploy. That is
-      //      a configuration change, so the row is *demoted to an ordinary
-      //      registration* instead.
+      //   2. Anything else: the operator no longer wants this pubkey to be an
+      //      env-configured admin. The row loses admin -- that is what
+      //      dc95d27 guarantees, and keeping it would mean removing someone
+      //      from the variable grants them admin forever -- but it is *not*
+      //      deleted. It stays registered as a `user` with its name, limit and
+      //      created_at intact.
       //
-      // Deleting in case 2 is indistinguishable from an operator revoking that
-      // npub: it takes the npub's own API keys with it, because a key whose
-      // recorded owner is no longer registered is now refused with
-      // `client_owner_not_registered` -- a message that says the owner was
-      // removed, when nobody was removed. When it was the last npub it also
-      // empties the table and re-opens the anonymous first-admin bootstrap
-      // window that the bootstrap-token work is there to close. Retiring an env
-      // var must not be able to do either, so only an explicit retirement
-      // deletes.
+      // Deleting in case 2 would take the npub's own API keys with it, because
+      // a key whose recorded owner is no longer registered is refused with
+      // `client_owner_not_registered`, and when it was the last npub it would
+      // empty the table and re-open the anonymous first-admin bootstrap window.
+      // An env var edit must not be able to do either. Full revocation is
+      // `DELETE /npubs/<npub>`; keeping the npub as an admin is
+      // `PATCH /npubs` with `role: admin` (the row is `source='api'` by then,
+      // so that sticks).
       const remove = this.db.prepare("DELETE FROM routstr_auth_npubs WHERE pubkey = ?");
       const demote = this.db.prepare(
-        "UPDATE routstr_auth_npubs SET source = 'api' WHERE pubkey = ?",
+        "UPDATE routstr_auth_npubs SET source = 'api', role = 'user' WHERE pubkey = ?",
       );
       const demoted: string[] = [];
 
@@ -227,13 +237,23 @@ export class AuthStore {
 
       if (demoted.length > 0) {
         console.warn(
-          `  Warning: ${demoted.length} npub(s) are no longer in ROUTSTRD_AUTH_ADMIN_NPUBS but stayed ` +
-            `registered as ordinary entries, so their existing API keys keep working: ${demoted.join(", ")}.`,
+          `  Warning: ${demoted.length} npub(s) left ROUTSTRD_AUTH_ADMIN_NPUBS and are no longer admin: ` +
+            `${demoted.join(", ")}. They stay registered as 'user', so their existing API keys keep working.`,
         );
         console.warn(
-          "  This was treated as a configuration change, not a revocation. To revoke one, use " +
-            "'DELETE /npubs/<npub>', or add it back to ROUTSTRD_AUTH_ADMIN_NPUBS and retire it from there.",
+          "  To revoke one completely, use 'DELETE /npubs/<npub>'. To keep one as an admin, " +
+            "'PATCH /npubs' it with role 'admin'.",
         );
+        const adminsLeft = this.db
+          .query("SELECT COUNT(*) AS count FROM routstr_auth_npubs WHERE role = 'admin'")
+          .get() as { count: number };
+        if (adminsLeft.count === 0) {
+          console.warn(
+            "  Warning: no admin npub is registered any more. The first-admin bootstrap stays closed " +
+              "because npubs are still registered, so set ROUTSTRD_AUTH_ADMIN_NPUBS again and restart " +
+              "to regain admin access.",
+          );
+        }
       }
     })();
   }

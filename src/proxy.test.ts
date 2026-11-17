@@ -1665,11 +1665,11 @@ describe("revocation when an npub is removed", () => {
   });
 });
 
-describe("retiring ROUTSTRD_AUTH_ADMIN_NPUBS does not revoke clients", () => {
-  // A pubkey leaving the env var is a configuration change. It must not look
-  // like an operator revoking that npub, because revoking is what refuses the
-  // npub's existing API keys and (when it was the last npub) re-opens the
-  // first-admin bootstrap window.
+describe("retiring ROUTSTRD_AUTH_ADMIN_NPUBS revokes admin but not clients", () => {
+  // A pubkey leaving the env var loses admin (dc95d27), but it must not look
+  // like an operator deleting that npub: deletion is what refuses the npub's
+  // existing API keys and (when it was the last npub) re-opens the first-admin
+  // bootstrap window.
   let tmp: { dbPath: string; cleanup: () => void };
   let upstream: ReturnType<typeof mockFetchUpstream>;
   let proxy: AuthProxy;
@@ -1767,7 +1767,33 @@ describe("retiring ROUTSTRD_AUTH_ADMIN_NPUBS does not revoke clients", () => {
     store.close();
   });
 
-  it("warns when a retired-from-env npub keeps its registration", async () => {
+  it("takes admin rights away from a pubkey that left the env var", async () => {
+    // Regression guard for dc95d27: removing someone from the variable must
+    // not leave them able to move funds.
+    const secret = generateSecretKey();
+    const pubkey = getPublicKey(secret);
+
+    async function walletSend(): Promise<Response> {
+      const payload = new TextEncoder().encode("{}");
+      const req = new Request("http://localhost:8008/wallet/send/cashu", {
+        method: "POST",
+        body: payload,
+      });
+      const auth = await nip98Authorization(secret, req, payload);
+      return proxy.handle(
+        new Request(req.url, { method: "POST", headers: { Authorization: auth }, body: payload }),
+      );
+    }
+
+    boot([pubkey]);
+    expect((await walletSend()).status).toBe(200);
+
+    boot([]);
+    expect((await walletSend()).status).toBe(403);
+    expect(upstream.calls).toHaveLength(1);
+  });
+
+  it("warns when a retired-from-env npub loses admin and keeps its registration", async () => {
     const warn = spyOn(console, "warn").mockImplementation(() => {});
     try {
       boot([ENV_ADMIN_PUBKEY]);
@@ -1775,7 +1801,12 @@ describe("retiring ROUTSTRD_AUTH_ADMIN_NPUBS does not revoke clients", () => {
       boot([]);
       const messages = warn.mock.calls.map((c) => c.join(" ")).join("\n");
       expect(messages).toContain(nip19.npubEncode(ENV_ADMIN_PUBKEY));
+      expect(messages).toContain("no longer admin");
       expect(messages).toContain("DELETE /npubs/");
+      expect(messages).toContain("PATCH /npubs");
+      // It was the only admin, so the operator must be told how to get back in.
+      expect(messages).toContain("no admin npub is registered");
+      expect(messages).not.toContain("retire it from there");
     } finally {
       warn.mockRestore();
     }
