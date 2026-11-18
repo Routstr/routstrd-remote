@@ -11,6 +11,9 @@ USER root
 # x64 Bun binary can crash there with SIGILL ("Illegal instruction").
 ARG BUN_VERSION=1.4.4
 ARG BUN_TARGET=bun-linux-x64-baseline
+# Refresh when changing BUN_VERSION or BUN_TARGET, using the matching entry in
+# https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/SHASUMS256.txt
+ARG BUN_SHA256=e0446eb55995772eb9894bebae9a6be368d985a8b9271ee124486f9946eedd76
 ENV BUN_INSTALL=/usr/local/bun
 ENV ROUTSTRD_DIR=/app/data/routstrd
 ENV PATH="/usr/local/bun/bin:/usr/local/bin:${PATH}"
@@ -18,6 +21,7 @@ ENV PATH="/usr/local/bun/bin:/usr/local/bin:${PATH}"
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates unzip \
     && curl -fsSL "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/${BUN_TARGET}.zip" -o /tmp/bun.zip \
+    && echo "${BUN_SHA256}  /tmp/bun.zip" | sha256sum -c - \
     && unzip /tmp/bun.zip -d /tmp \
     && mkdir -p /usr/local/bun/bin \
     && mv "/tmp/${BUN_TARGET}/bun" /usr/local/bun/bin/bun \

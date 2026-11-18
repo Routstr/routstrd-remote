@@ -1,9 +1,12 @@
 #!/bin/sh
 set -e
+umask 077
 
 # Ensure data directories exist for routstrd
 export ROUTSTRD_DIR="${ROUTSTRD_DIR:-/data/routstrd}"
 mkdir -p "$ROUTSTRD_DIR" /data/logs
+# Repair existing credentials before rewriting config or starting the daemon.
+chmod -R go-rwx -- "$ROUTSTRD_DIR"
 
 # routstrd stays local to the container. routstrd-auth is the public service.
 ROUTSTRD_PORT="${ROUTSTRD_PORT:-${PORT:-8008}}"

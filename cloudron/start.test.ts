@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -13,6 +13,8 @@ function sandbox(test: (fixture: ReturnType<typeof createSandbox>) => void) {
     rmSync(fixture.root, { recursive: true, force: true });
   }
 }
+
+const mode = (path: string) => statSync(path).mode & 0o777;
 
 function createSandbox() {
   const root = mkdtempSync(join(tmpdir(), "cloudron-start-test-"));
@@ -28,7 +30,8 @@ function createSandbox() {
   };
   command("chown", ":");
   command("gosu", 'shift; exec "$@"');
-  command("bun", 'echo configure >> "$TRACE"');
+  command("bun", 'echo configure >> "$TRACE"; printf "{}" > "$3"');
+  command("chmod", 'if [[ "$MODE" == repair-failure ]]; then echo "repair failed" >&2; exit 25; fi; exec /bin/chmod "$@"');
   command("routstrd", `
     echo "$1" >> "$TRACE"
     case "$1" in
@@ -47,6 +50,10 @@ function createSandbox() {
           kill -TERM "$$"
         fi
         ;;
+      start)
+        # Legacy Docker script launches the daemon here, after startup repair.
+        touch "$ROUTSTRD_DIR/routstr.db"
+        exit 42 ;; # stop the fixture before the health-check loop
       stop)
         if [[ "$MODE" == stop-failure ]]; then
           echo "Wallet daemon still holds lock" >&2
@@ -56,19 +63,22 @@ function createSandbox() {
       *) exit 99 ;;
     esac
   `);
-  const supervisor = command("supervisord", 'echo supervisor >> "$TRACE"');
+  const supervisor = command("supervisord", 'echo supervisor >> "$TRACE"; touch "$ROUTSTRD_DB_PATH"');
   const script = join(root, "start.sh");
   writeFileSync(script, readFileSync(new URL("./start.sh", import.meta.url), "utf8")
     .replaceAll("/app/data", data)
     .replaceAll("/usr/bin/supervisord", supervisor));
 
+  const legacy = join(root, "docker-entrypoint.sh");
+  writeFileSync(legacy, readFileSync(new URL("../docker-entrypoint.sh", import.meta.url), "utf8").replaceAll("/data/", `${data}/`));
   return {
     root,
     wallet: join(data, "routstrd/wallet/config.json"),
+    routstrdDir: join(data, "routstrd"),
     initialized: join(data, ".initialized"),
-    run(mode = "success") {
+    run(mode = "success", docker = false) {
       writeFileSync(trace, "");
-      const result = Bun.spawnSync(["bash", script], {
+      const result = Bun.spawnSync(["sh", "-c", 'umask 022; exec "$@"', "fixture", docker ? "sh" : "bash", docker ? legacy : script], {
         env: {
           PATH: `${bin}:/usr/bin:/bin`,
           TRACE: trace,
@@ -80,13 +90,36 @@ function createSandbox() {
       return {
         code: result.exitCode,
         stderr: result.stderr.toString(),
-        calls: readFileSync(trace, "utf8").trim().split("\n"),
+        calls: readFileSync(trace, "utf8").trim().split("\n").filter(Boolean),
       };
     },
   };
 }
 
 describe("Cloudron first-boot failure handling", () => {
+  for (const docker of [false, true]) {
+    const path = docker ? "legacy Docker" : "Cloudron";
+    it(`${path}: creates private files before and after daemon handoff`, () => sandbox((f) => {
+      expect(f.run("success", docker).code).toBe(docker ? 42 : 0);
+      expect(mode(f.routstrdDir)).toBe(0o700);
+      expect(mode(join(f.routstrdDir, "config.json"))).toBe(0o600);
+      expect(mode(join(f.routstrdDir, "routstr.db"))).toBe(0o600);
+    }));
+    it(`${path}: repairs legacy data and stops on repair failure`, () => sandbox((f) => {
+      mkdirSync(f.routstrdDir, { recursive: true });
+      const config = join(f.routstrdDir, "config.json");
+      writeFileSync(config, "{}");
+      chmodSync(config, 0o644);
+      const failure = f.run("repair-failure", docker);
+      expect(failure.code).toBe(25);
+      expect(failure.stderr).toContain("repair failed");
+      expect(failure.calls).toEqual([]);
+      expect(f.run("success", docker).code).toBe(docker ? 42 : 0);
+      expect(mode(config)).toBe(0o600);
+      expect(mode(f.routstrdDir) & 0o077).toBe(0);
+    }));
+  }
+
   it("onboards and stops the daemon before configuration and supervisord", () => sandbox((f) => {
     const result = f.run();
     expect(result.code).toBe(0);
@@ -111,6 +144,7 @@ describe("Cloudron first-boot failure handling", () => {
     expect(existsSync(f.wallet)).toBe(true);
     expect(existsSync(f.initialized)).toBe(false);
     // A completed wallet config survives interruption; restarting skips onboarding.
+    expect(mode(f.wallet)).toBe(0o600);
     const walletBefore = readFileSync(f.wallet, "utf8");
     const retry = f.run();
     expect(retry.code).toBe(0);
@@ -126,6 +160,7 @@ describe("Cloudron first-boot failure handling", () => {
     expect(result.calls).toEqual(["onboard"]);
     expect(existsSync(f.wallet)).toBe(true);
     expect(existsSync(f.initialized)).toBe(false);
+    expect(mode(f.wallet)).toBe(0o600);
     const walletBefore = readFileSync(f.wallet, "utf8");
     const retry = f.run("network-failure");
     expect(retry.code).toBe(0);
