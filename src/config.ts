@@ -1,3 +1,4 @@
+import { parseReplayCacheMax } from "./replay-cache";
 import { join } from "path";
 import { existsSync } from "fs";
 import { nip19 } from "nostr-tools";
@@ -119,6 +120,8 @@ export interface AuthProxyConfig {
    * request's own URL plus `x-forwarded-*` headers, which the caller controls.
    */
   publicUrl: string | null;
+  /** Maximum live NIP-98 event IDs retained by each proxy. */
+  replayCacheMax?: number;
   /**
    * One-time token that authorises the first-admin bootstrap while the npub
    * table is empty. `null` means "generate one at startup" (and log it), which
@@ -177,6 +180,7 @@ export function loadConfig(): AuthProxyConfig {
     adminPubkeys: adminPubkeys.pubkeys,
     invalidAdminPubkeys: adminPubkeys.invalid,
     modelAllowlistEnabled: MODEL_ALLOWLIST_ENABLED,
+    replayCacheMax: parseReplayCacheMax(process.env.ROUTSTRD_AUTH_REPLAY_CACHE_MAX),
     bootstrapToken: process.env.ROUTSTRD_AUTH_BOOTSTRAP_TOKEN || null,
     publicUrl: normalizePublicUrl(
       process.env.ROUTSTRD_AUTH_PUBLIC_URL?.trim() || process.env.CLOUDRON_APP_ORIGIN,

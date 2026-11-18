@@ -158,7 +158,7 @@ async function nip98AuthorizationFor(
   method: string,
   body?: Uint8Array,
 ): Promise<string> {
-  const tags: string[][] = [["u", url], ["method", method]];
+  const tags: string[][] = [["u", url], ["method", method], ["nonce", crypto.randomUUID()]];
   if (body && body.byteLength > 0) {
     tags.push(["payload", await sha256Hex(body)]);
   }
@@ -552,6 +552,8 @@ describe("npub name endpoints", () => {
     const pubkey = getPublicKey(secretKey);
     const store = new AuthStore(tmp.dbPath);
     store.addNpub(pubkey, "admin", null, "Alice");
+    // A second admin, because demoting the only one is refused (last_admin).
+    store.addNpub("ab".repeat(32), "admin", null, "Second");
     store.close();
 
     proxy.close();
@@ -2365,4 +2367,226 @@ describe("Monthly spend limits", () => {
   function proxyWithoutDb() {
     return new AuthProxy(makeConfig(tmp.dbPath));
   }
+});
+
+describe("NIP-98 replay", () => {
+  let tmp: { dbPath: string; cleanup: () => void };
+  let proxy: AuthProxy;
+
+  beforeEach(() => {
+    tmp = createTmpDb();
+  });
+
+  afterEach(() => {
+    proxy?.close();
+    tmp.cleanup();
+  });
+
+  it("refuses an event that was already used", async () => {
+    const secretKey = generateSecretKey();
+    const store = new AuthStore(tmp.dbPath);
+    store.addNpub(getPublicKey(secretKey), "admin", null, "Alice");
+    store.close();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+
+    const req = new Request("http://localhost:8008/npubs");
+    const token = await nip98Authorization(secretKey, req);
+    const headers: Record<string, string> = { Authorization: token };
+
+    const first = await proxy.handle(new Request(req.url, { headers }));
+    expect(first.status).toBe(200);
+
+    // Same signed event, presented again inside the freshness window.
+    const second = await proxy.handle(new Request(req.url, { headers }));
+    expect(second.status).toBe(401);
+    expect((await second.json()).error).toContain("already been used");
+  });
+});
+
+describe("replay admission integration", () => {
+  let tmp: { dbPath: string; cleanup: () => void };
+  let proxy: AuthProxy;
+  let secret: Uint8Array;
+  const url = "http://localhost:8008/npubs";
+  const fixed = 1700000000000;
+  let clock: ReturnType<typeof spyOn>;
+
+  beforeEach(() => {
+    clock = spyOn(Date, "now").mockReturnValue(fixed);
+    tmp = createTmpDb();
+    secret = generateSecretKey();
+    const store = new AuthStore(tmp.dbPath);
+    store.addNpub(getPublicKey(secret), "admin", null, "Alice");
+    store.close();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath, { replayCacheMax: 1 }), () => fixed);
+  });
+  afterEach(() => { proxy.close(); tmp.cleanup(); clock.mockRestore(); });
+
+  const send = (token: string, method = "GET", body?: Uint8Array) => proxy.handle(
+    new Request(url, { method, body, headers: { Authorization: token } }),
+  );
+
+  it("accepts unique same-second requests but refuses each exact reused event", async () => {
+    proxy.close();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath, { replayCacheMax: 2 }), () => fixed);
+    const a = await nip98AuthorizationFor(secret, url, "GET");
+    const b = await nip98AuthorizationFor(secret, url, "GET");
+    const decode = (token: string) => JSON.parse(atob(token.slice(6).replace(/-/g, "+").replace(/_/g, "/")));
+    expect(decode(a).created_at).toBe(decode(b).created_at);
+    expect(decode(a).id).not.toBe(decode(b).id);
+    expect((await send(a)).status).toBe(200);
+    expect((await send(b)).status).toBe(200);
+    for (const token of [a, b]) {
+      const response = await send(token);
+      expect(response.status).toBe(401);
+      expect((await response.json()).code).toBe("nip98_replayed");
+    }
+  });
+
+  it("admits only one concurrent presentation", async () => {
+    const token = await nip98AuthorizationFor(secret, url, "GET");
+    const results = await Promise.all([send(token), send(token)]);
+    expect(results.map(r => r.status).sort()).toEqual([200, 401]);
+  });
+
+  it("admits only one concurrently hashed payload before mutation", async () => {
+    const body = new TextEncoder().encode(JSON.stringify({ pubkey: getPublicKey(secret), name: "Renamed" }));
+    const token = await nip98AuthorizationFor(secret, url, "PATCH", body);
+    const responses = await Promise.all([send(token, "PATCH", body), send(token, "PATCH", body)]);
+    expect(responses.map(r => r.status).sort()).toEqual([200, 401]);
+  });
+
+  it("isolates caches between proxy instances", async () => {
+    const token = await nip98AuthorizationFor(secret, url, "GET");
+    expect((await send(token)).status).toBe(200);
+    const other = new AuthProxy(makeConfig(tmp.dbPath), () => fixed);
+    try {
+      expect((await other.handle(new Request(url, { headers: { Authorization: token } }))).status).toBe(200);
+    } finally { other.close(); }
+  });
+
+  it("returns 503 with retry metadata without forgetting an accepted ID", async () => {
+    const token = await nip98AuthorizationFor(secret, url, "GET");
+    expect((await send(token)).status).toBe(200);
+    const response = await send(await nip98AuthorizationFor(secret, url, "GET"));
+    expect(response.status).toBe(503);
+    expect(response.headers.get("Retry-After")).toBe("125");
+    expect((await response.json()).code).toBe("replay_cache_saturated");
+    expect((await send(token)).status).toBe(401);
+  });
+
+  it("unregistered and insufficient-role callers do not consume capacity", async () => {
+    const other = generateSecretKey();
+    expect((await send(await nip98AuthorizationFor(other, url, "GET"))).status).toBe(403);
+    const store = new AuthStore(tmp.dbPath);
+    store.addNpub(getPublicKey(other), "user", null, "Bob");
+    store.close();
+    const payload = new TextEncoder().encode(JSON.stringify({ pubkey: getPublicKey(secret), name: "Alice" }));
+    expect((await send(await nip98AuthorizationFor(other, url, "PATCH", payload), "PATCH", payload)).status).toBe(403);
+    expect((await send(await nip98AuthorizationFor(secret, url, "GET"))).status).toBe(200);
+  });
+
+  it("wrong method and payload do not burn a valid event", async () => {
+    const body = new TextEncoder().encode(JSON.stringify({ pubkey: getPublicKey(secret), name: "Alice" }));
+    const token = await nip98AuthorizationFor(secret, url, "PATCH", body);
+    expect((await send(token)).status).toBe(401);
+    expect((await send(token, "PATCH", new TextEncoder().encode("{}"))).status).toBe(401);
+    expect((await send(token, "PATCH", body)).status).toBe(200);
+  });
+
+  it("empty-table read-only bootstrap is exempt, and does not fill capacity", async () => {
+    const store = new AuthStore(tmp.dbPath);
+    store.removeNpub(getPublicKey(secret));
+    const token = await nip98AuthorizationFor(secret, url, "GET");
+    expect((await send(token)).status).toBe(200);
+    expect((await send(token)).status).toBe(200);
+    store.addNpub(getPublicKey(secret), "admin", null, "Alice");
+    store.close();
+    expect((await send(token)).status).toBe(200);
+    expect((await send(token)).status).toBe(401);
+  });
+});
+
+describe("last admin guard", () => {
+  let tmp: { dbPath: string; cleanup: () => void };
+  let proxy: AuthProxy;
+  let secretKey: Uint8Array;
+  let pubkey: string;
+  let npub: string;
+
+  beforeEach(() => {
+    tmp = createTmpDb();
+    secretKey = generateSecretKey();
+    pubkey = getPublicKey(secretKey);
+    const store = new AuthStore(tmp.dbPath);
+    npub = store.addNpub(pubkey, "admin", null, "Alice").npub;
+    store.close();
+    proxy = new AuthProxy(makeConfig(tmp.dbPath));
+  });
+
+  afterEach(() => {
+    proxy?.close();
+    tmp.cleanup();
+  });
+
+  async function call(method: string, path: string, payload?: Uint8Array): Promise<Response> {
+    const url = `http://localhost:8008${path}`;
+    const signed = new Request(url, { method, body: payload });
+    const token = await nip98Authorization(secretKey, signed, payload);
+    const headers: Record<string, string> = { Authorization: token };
+    return proxy.handle(new Request(url, { method, headers, body: payload }));
+  }
+
+  it("refuses to remove the only admin", async () => {
+    const res = await call("DELETE", `/npubs/${npub}`);
+    expect(res.status).toBe(409);
+    expect((await res.json()).code).toBe("last_admin");
+
+    const store = new AuthStore(tmp.dbPath);
+    expect(store.countNpubs("admin")).toBe(1);
+    store.close();
+  });
+
+  it("refuses to demote the only admin", async () => {
+    const payload = new TextEncoder().encode(
+      JSON.stringify({ pubkey, role: "user", name: "Alice" }),
+    );
+    const res = await call("PATCH", "/npubs", payload);
+    expect(res.status).toBe(409);
+    expect((await res.json()).code).toBe("last_admin");
+  });
+
+  it("allows removing an admin once another one exists", async () => {
+    const store = new AuthStore(tmp.dbPath);
+    const other = store.addNpub("ab".repeat(32), "admin", null, "Second");
+    store.close();
+
+    const res = await call("DELETE", `/npubs/${other.npub}`);
+    expect(res.status).toBe(200);
+    expect((await res.json()).removed).toBe(true);
+  });
+
+  it("guards the query-parameter DELETE form", async () => {
+    const response = await call("DELETE", `/npubs?npub=${npub}`);
+    expect(response.status).toBe(409);
+    expect((await response.json()).code).toBe("last_admin");
+  });
+
+  it("allows demotion when another admin exists", async () => {
+    const store = new AuthStore(tmp.dbPath);
+    store.addNpub("ab".repeat(32), "admin", null, "Second");
+    store.close();
+    const body = new TextEncoder().encode(JSON.stringify({ pubkey, role: "user" }));
+    expect((await call("PATCH", "/npubs", body)).status).toBe(200);
+  });
+
+  it("still allows removing a non-admin", async () => {
+    const store = new AuthStore(tmp.dbPath);
+    const member = store.addNpub("cd".repeat(32), "user", null, "Member");
+    store.close();
+
+    const res = await call("DELETE", `/npubs/${member.npub}`);
+    expect(res.status).toBe(200);
+    expect((await res.json()).removed).toBe(true);
+  });
 });

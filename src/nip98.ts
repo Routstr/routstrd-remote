@@ -129,6 +129,7 @@ export async function validateNIP98Request(
   req: Request,
   body?: Uint8Array,
   publicUrl?: string | null,
+  nowSeconds: () => number = () => Math.round(Date.now() / 1000),
 ): Promise<NIP98ValidationResult> {
   const event = decodeAuthorizationEvent(authorization);
 
@@ -140,11 +141,7 @@ export async function validateNIP98Request(
     throw new Error("Invalid NIP-98 timestamp.");
   }
 
-  const now = Math.round(Date.now() / 1000);
-  const age = now - event.created_at;
-  if (age > NIP98_MAX_AGE_SECONDS || age < -NIP98_MAX_AGE_SECONDS) {
-    throw new Error("NIP-98 event timestamp is outside the allowed window.");
-  }
+  assertNip98Fresh(event.created_at, nowSeconds());
 
   const urlTag = getTag(event, "u");
   if (urlTag !== getAbsoluteRequestUrl(req, publicUrl)) {
@@ -172,7 +169,14 @@ export async function validateNIP98Request(
     throw new Error("Invalid NIP-98 event signature.");
   }
 
+  assertNip98Fresh(event.created_at, nowSeconds());
   return { pubkey: event.pubkey, event };
+}
+
+export function assertNip98Fresh(createdAt: number, now: number): void {
+  if (!Number.isFinite(createdAt) || Math.abs(now - createdAt) > NIP98_MAX_AGE_SECONDS) {
+    throw new Error("NIP-98 event timestamp is outside the allowed window.");
+  }
 }
 
 export function isNIP98Authorization(authorization: string | null): boolean {

@@ -78,7 +78,7 @@ On success, the server extracts the `pubkey` from the event — this is the user
 
 | Property | How It's Achieved |
 |----------|-------------------|
-| **No replay attacks** | Timestamp must be recent (~60s window) |
+| **Replay protection** | Fresh timestamp plus single-use event IDs in this proxy instance (except empty-table bootstrap reads) |
 | **No request hijacking** | URL and method are bound to the signed event |
 | **No payload tampering** | Optional SHA-256 hash of body |
 | **No credential storage** | Server only needs the user's pubkey |
@@ -126,6 +126,7 @@ async function getToken(
     tags: [
       ['u', url],
       ['method', method],
+      ['nonce', crypto.randomUUID()], // unique even for identical same-second requests
     ],
     created_at: Math.round(Date.now() / 1000),
     content: '',
@@ -202,3 +203,23 @@ This auth proxy (`routstrd-auth`) currently uses **Bearer token authentication**
 - Accept `Authorization: Nostr <base64-event>` header alongside `Authorization: Bearer sk-...`
 - Extract `pubkey` from validated NIP-98 event as the client identifier
 - Maintain backward compatibility with existing Bearer token flow
+
+## Proxy single-use contract and rollout
+
+Sign a fresh event with a random `nonce` tag for every HTTP request. A fresh
+signature alone does not change an event ID: identical signed fields within one
+second hash to the same ID. Additional tags are accepted without requiring a
+specific nonce tag. Exact event reuse returns `401 nip98_replayed`.
+
+After registration and role authorization, the proxy consumes the ID before the
+action. Later application failures still consume it. Empty-table `GET /npubs` is
+read-only and deliberately exempt. The bounded, per-proxy in-memory cache retains
+IDs for 125 seconds; it does not survive restarts or protect across instances.
+Capacity exhaustion returns `503 replay_cache_saturated` and `Retry-After`, never
+evicts a still-valid ID. See README for capacity sizing and clock policy.
+Re-signing a retry is not operation-level idempotency: do not automatically retry
+wallet sends after ambiguous responses.
+
+Release this guard only after shipping routstrd signer commit `9a60f13` in the
+bundled daemon. Its [NGIT PR](https://njump.me/nevent1qqsxq8l8fgkr60frayjd3gwa8ercyk56nhwvw93rflk2ql2yc8wweegpz3mhxue69uhhyetvv9ujumn8d96zuer9wcntsqtw)
+is available, but no daemon release or bundled-version bump is made by this PR.

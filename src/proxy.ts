@@ -1,3 +1,4 @@
+import { ReplayCache, ReplayError, nondecreasingClock, DEFAULT_REPLAY_CACHE_MAX } from "./replay-cache";
 import { normalizeNostrPubkey, type AuthProxyConfig } from "./config";
 import { validateNIP98Request } from "./nip98";
 import { requestAuthorization } from "./auth";
@@ -91,7 +92,12 @@ export class AuthProxy {
   /** One-time first-admin token; null once an npub exists. */
   private bootstrapToken: string | null;
 
-  constructor(config: AuthProxyConfig) {
+  private readonly authNow: () => number;
+  private readonly replayCache: ReplayCache;
+
+  constructor(config: AuthProxyConfig, wallNow: () => number = Date.now) {
+    this.authNow = nondecreasingClock(wallNow);
+    this.replayCache = new ReplayCache(config.replayCacheMax ?? DEFAULT_REPLAY_CACHE_MAX, this.authNow);
     this.config = config;
     this.store = new AuthStore(config.dbPath, config.adminPubkeys);
     // Only mint a token while there is a bootstrap window to protect. Once an
@@ -412,11 +418,12 @@ export class AuthProxy {
     }
 
     try {
-      const { pubkey } = await validateNIP98Request(
+      const { pubkey, event } = await validateNIP98Request(
         authorization,
         req,
         body,
         this.config.publicUrl,
+        this.authNow,
       );
 
       const entry = this.store.getNpubByPubkey(pubkey);
@@ -434,8 +441,16 @@ export class AuthProxy {
         }, 403);
       }
 
+      // No await between admission and returning authorization: duplicates cannot
+      // both pass, and unregistered/insufficient-role callers never occupy space.
+      this.replayCache.consume(event);
       return { pubkey, npub: entry.npub, role: entry.role };
     } catch (err) {
+      if (err instanceof ReplayError) {
+        return this.json({ error: err.message, code: err.code },
+          err.code === "nip98_replayed" ? 401 : 503,
+          err.retryAfter ? { "Retry-After": String(err.retryAfter) } : undefined);
+      }
       return this.json({
         error: err instanceof Error ? err.message : "Invalid NIP-98 token.",
       }, 401);
@@ -793,6 +808,7 @@ export class AuthProxy {
       // whether an admin already exists. Requiring a *registered* npub here
       // deadlocks bootstrap (nothing is registered yet), so when the store is
       // empty accept any valid NIP-98 event and return an empty list.
+      // Read-only bootstrap lookup is deliberately exempt from replay admission.
       if (this.store.countNpubs() === 0) {
         if (!authorization) {
           return this.json({
@@ -811,6 +827,7 @@ export class AuthProxy {
             req,
             undefined,
             this.config.publicUrl,
+            this.authNow,
           );
         } catch (err) {
           return this.json({
@@ -945,6 +962,20 @@ export class AuthProxy {
         return this.json({ error: "Provide the npub/pubkey to remove in /npubs/<npub>, ?npub=..., or the JSON body." }, 400);
       }
 
+      const target = this.store.getNpubByPubkey(pubkey);
+      if (!target) return this.json({ removed: false });
+
+      // Emptying the admin list locks out management. No await separates
+      // this count check from the write in this single-process handler.
+      // Bootstrap is separately token-gated; this guard prevents administrative lockout.
+      if (target.role === "admin" && this.store.countNpubs("admin") <= 1) {
+        return this.json({
+          error:
+            "Refusing to remove the last admin. Add another admin first, then remove this one.",
+          code: "last_admin",
+        }, 409);
+      }
+
       const removed = this.store.removeNpub(pubkey);
       return this.json({ removed });
     }
@@ -974,6 +1005,18 @@ export class AuthProxy {
           error:
             "Missing required field. Provide 'role', 'name', and/or 'monthlyLimitSats' to update.",
         }, 400);
+      }
+
+      // Demoting the last admin is the same lockout as deleting it.
+      if (parsed.role === "user") {
+        const current = this.store.getNpubByPubkey(parsed.pubkey);
+        if (current?.role === "admin" && this.store.countNpubs("admin") <= 1) {
+          return this.json({
+            error:
+              "Refusing to demote the last admin. Promote another npub to admin first.",
+            code: "last_admin",
+          }, 409);
+        }
       }
 
       const updated = this.store.updateNpub(parsed.pubkey, {
@@ -1161,6 +1204,7 @@ export class AuthProxy {
   /** Start the Bun HTTP server. */
   serve() {
     const { port, host } = this.config;
+    console.log(`  NIP-98 replay cache capacity: ${this.config.replayCacheMax ?? DEFAULT_REPLAY_CACHE_MAX}`);
     const npubCount = this.store.countNpubs();
     console.log(`routstrd-auth proxy listening on http://${host}:${port}`);
     console.log(`  Upstream: ${this.config.upstream}`);
