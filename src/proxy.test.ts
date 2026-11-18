@@ -1247,7 +1247,7 @@ describe("daemon route capability boundary", () => {
 
   it("requires admin NIP-98 for the offline-send settlement routes", async () => {
     // Both move value, and both are new in routstrd 0.5.0. `mark-spent` carries
-    // an operation id, so it is matched by prefix rather than by exact path.
+    // an operation id, so its policy must allow that parameterized path.
     const userSecret = registerNpub("user");
     const adminSecret = registerNpub("admin");
     const routes = [
@@ -1317,35 +1317,38 @@ describe("daemon route capability boundary", () => {
     expect(upstream.calls).toHaveLength(routes.length);
   });
 
-  it("matches admin prefixes only on a full path segment", () => {
-    expect(AuthProxy.isAdminPath("POST", "/wallet/send/cashu/op1/mark-spent")).toBe(true);
-    expect(AuthProxy.isAdminPath("POST", "/wallet/send/cashu/")).toBe(true);
-    // The trailing slash in the prefix is load-bearing: a lookalike route one
-    // segment over must not inherit admin-only treatment.
-    expect(AuthProxy.isAdminPath("POST", "/wallet/send/cashuX")).toBe(false);
-    expect(AuthProxy.isAdminPath("POST", "/wallet/send")).toBe(false);
-    // Reads and non-mutating wallet routes stay open to any registered npub.
-    expect(AuthProxy.isAdminPath("POST", "/wallet/balance")).toBe(false);
-    // Not a read despite the name: it marks proofs spent by default.
-    expect(AuthProxy.isAdminPath("POST", "/requests")).toBe(false);
-    // State-changing wallet routes are admin-only, and matching is exact, so a
-    // read of the same resource (`GET /wallet/mints`) is a separate entry.
-    expect(AuthProxy.isAdminPath("POST", "/wallet/unlock")).toBe(true);
-    expect(AuthProxy.isAdminPath("POST", "/wallet/mints")).toBe(true);
-    expect(AuthProxy.isAdminPath("POST", "/wallet/mints/default")).toBe(true);
-    expect(AuthProxy.isAdminPath("POST", "/wallet/cleanup")).toBe(true);
-    expect(AuthProxy.isAdminPath("POST", "/wallet/check-proofs")).toBe(true);
-    expect(AuthProxy.isAdminPath("POST", "/wallet/recover")).toBe(true);
-    expect(AuthProxy.isAdminPath("POST", "/wallet/recover/operations")).toBe(true);
-    expect(AuthProxy.isAdminPath("POST", "/wallet/recoverX")).toBe(false);
-    // Method-aware entries: changing the mint set is admin work, reading it is
-    // not, and the daemon serves both on the same path.
-    expect(AuthProxy.isAdminPath("GET", "/wallet/mints")).toBe(false);
-    expect(AuthProxy.isAdminPath("GET", "/wallet/mints/default")).toBe(false);
-    expect(AuthProxy.isAdminPath("HEAD", "/wallet/mints")).toBe(false);
-    expect(AuthProxy.isAdminPath("PUT", "/wallet/mints")).toBe(false);
-    // Lowercase methods are normalized, matching isInferencePath.
-    expect(AuthProxy.isAdminPath("post", "/wallet/mints")).toBe(true);
+  const unknownRoutes = [
+    ["DELETE", "/wallet/mints"],                   // new verb on a known resource
+    ["POST", "/future/admin"],                     // new daemon endpoint
+    ["GET", "/models/test/unreviewed"],            // previously public by prefix
+    ["GET", "/v1/models/test/unreviewed"],
+    ["POST", "/wallet/send/cashu/op1/op2/mark-spent"], // extra parameter segment
+  ] as const;
+
+  for (const [method, path] of unknownRoutes) {
+    it(`does not forward unclassified ${method} ${path} for any credential`, async () => {
+      const member = registerNpub("user");
+      const admin = registerNpub("admin");
+      const requests = [
+        await signedRequest(member, method, path),
+        await signedRequest(admin, method, path),
+        new Request(`http://localhost:8008${path}`, { method }),
+        clientRequest(method, path),
+        clientRequest(method, path, "x-api-key"),
+      ];
+      for (const req of requests) {
+        expect((await proxy.handle(req)).status).toBe(404);
+        expect(upstream.calls).toHaveLength(0);
+      }
+    });
+  }
+
+  it("still allows anonymous reads on reviewed model detail routes", async () => {
+    const paths = ["/models/test/providers", "/models/test/paths?view=candidates"];
+    for (const path of paths) {
+      expect((await proxy.handle(new Request(`http://localhost:8008${path}`))).status).toBe(200);
+    }
+    expect(upstream.calls).toHaveLength(paths.length);
   });
 
   it("preserves existing registered-user daemon access", async () => {
