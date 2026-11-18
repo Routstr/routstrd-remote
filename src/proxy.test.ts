@@ -1330,14 +1330,15 @@ describe("daemon route capability boundary", () => {
       const member = registerNpub("user");
       const admin = registerNpub("admin");
       const requests = [
-        await signedRequest(member, method, path),
-        await signedRequest(admin, method, path),
-        new Request(`http://localhost:8008${path}`, { method }),
-        clientRequest(method, path),
-        clientRequest(method, path, "x-api-key"),
-      ];
-      for (const req of requests) {
-        expect((await proxy.handle(req)).status).toBe(404);
+        [await signedRequest(member, method, path), 404],
+        [await signedRequest(admin, method, path), 404],
+        [new Request(`http://localhost:8008${path}`, { method }), 404],
+        // Client credentials retain the inference-only capability response.
+        [clientRequest(method, path), 403],
+        [clientRequest(method, path, "x-api-key"), 403],
+      ] as const;
+      for (const [req, status] of requests) {
+        expect((await proxy.handle(req)).status).toBe(status);
         expect(upstream.calls).toHaveLength(0);
       }
     });
