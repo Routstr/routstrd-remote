@@ -1,3 +1,4 @@
+import { ReplayCache, ReplayError, nondecreasingClock, DEFAULT_REPLAY_CACHE_MAX } from "./replay-cache";
 import { normalizeNostrPubkey, type AuthProxyConfig } from "./config";
 import { validateNIP98Request } from "./nip98";
 import { requestAuthorization } from "./auth";
@@ -24,6 +25,47 @@ const NPUB_NAME_REQUIRED_ERROR =
 const NPUB_NAME_CLEAR_ERROR =
   "Invalid name. A display name cannot be removed; provide a new name (1-64 characters).";
 
+/**
+ * Header carrying the one-time first-admin bootstrap token.
+ *
+ * The token is generated at startup (or taken from
+ * `ROUTSTRD_AUTH_BOOTSTRAP_TOKEN`) and printed to the app log while the npub
+ * table is empty. It is required to claim the first admin, because the app is
+ * reachable from the internet the moment Cloudron installs it and an
+ * unauthenticated `POST /npubs` hands the wallet and provider credentials to
+ * whoever gets there first.
+ */
+export const BOOTSTRAP_TOKEN_HEADER = "x-routstr-bootstrap-token";
+
+/**
+ * Management bodies are small JSON documents (an npub and a name). Anything
+ * larger is refused without being read into memory, which is the difference
+ * between a 413 and an OOM kill on a 512 MB container.
+ */
+export const MAX_MANAGEMENT_BODY_BYTES = 1024 * 1024;
+
+/** Missing-credential answer shared by every management route. */
+const MISSING_MANAGEMENT_AUTH =
+  "Missing Authorization header. This endpoint requires NIP-98 auth from a registered npub/pubkey.";
+
+function generateBootstrapToken(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(24));
+  return btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+/** Constant-time comparison for the bootstrap token. */
+function tokensMatch(a: string, b: string): boolean {
+  const left = new TextEncoder().encode(a);
+  const right = new TextEncoder().encode(b);
+  if (left.byteLength !== right.byteLength) return false;
+  let diff = 0;
+  for (let i = 0; i < left.byteLength; i++) diff |= left[i]! ^ right[i]!;
+  return diff === 0;
+}
+
 /** Parsed body of the npub management endpoints (`POST`/`PATCH /npubs`). */
 interface NpubBody {
   pubkey: string;
@@ -31,6 +73,15 @@ interface NpubBody {
   name?: string | null;
   monthlyLimitSats?: number | null;
 }
+
+/**
+ * Per-request handle to the Bun server, threaded from the fetch callback so an
+ * authenticated request can lift the idle timeout and nothing else can.
+ */
+interface RequestContext {
+  server?: { timeout(request: Request, seconds: number): void };
+}
+
 /**
  * Thin proxy that validates Bearer tokens or NIP-98 Nostr HTTP auth events and
  * forwards requests to the routstrd daemon running on localhost only.
@@ -38,10 +89,133 @@ interface NpubBody {
 export class AuthProxy {
   private config: AuthProxyConfig;
   private store: AuthStore;
+  /** One-time first-admin token; null once an npub exists. */
+  private bootstrapToken: string | null;
 
-  constructor(config: AuthProxyConfig) {
+  private readonly authNow: () => number;
+  private readonly replayCache: ReplayCache;
+
+  constructor(config: AuthProxyConfig, wallNow: () => number = Date.now) {
+    this.authNow = nondecreasingClock(wallNow);
+    this.replayCache = new ReplayCache(config.replayCacheMax ?? DEFAULT_REPLAY_CACHE_MAX, this.authNow);
     this.config = config;
     this.store = new AuthStore(config.dbPath, config.adminPubkeys);
+    // Only mint a token while there is a bootstrap window to protect. Once an
+    // npub exists the window is closed by the store itself.
+    this.bootstrapToken =
+      config.bootstrapToken ??
+      (this.store.countNpubs() === 0 ? generateBootstrapToken() : null);
+  }
+
+  /** The token the operator must present to claim the first admin, if any. */
+  getBootstrapToken(): string | null {
+    return this.bootstrapToken;
+  }
+
+  /** True when the request carries the current bootstrap token. */
+  private hasValidBootstrapToken(req: Request): boolean {
+    const supplied = req.headers.get(BOOTSTRAP_TOKEN_HEADER);
+    if (!supplied) return false;
+    // Read the live value: a successful claim clears it.
+    if (!this.bootstrapToken) return false;
+    return tokensMatch(supplied.trim(), this.bootstrapToken);
+  }
+
+  /**
+   * Read a request body without letting the caller choose how much memory it
+   * costs. The declared length is checked first (cheap), then the stream is
+   * read in chunks and abandoned as soon as it passes `maxBytes`, so a chunked
+   * body with no `Content-Length` cannot be buffered either.
+   */
+  private async readBody(
+    req: Request,
+    maxBytes: number = MAX_MANAGEMENT_BODY_BYTES,
+  ): Promise<Uint8Array | Response> {
+    const declared = req.headers.get("content-length");
+    if (declared !== null) {
+      const length = Number(declared);
+      if (!Number.isFinite(length) || length < 0) {
+        return this.json({ error: "Invalid Content-Length." }, 400);
+      }
+      if (length > maxBytes) return this.tooLarge(maxBytes);
+    }
+
+    if (!req.body) return new Uint8Array(0);
+
+    const reader = req.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        total += value.byteLength;
+        if (total > maxBytes) {
+          await reader.cancel().catch(() => {});
+          return this.tooLarge(maxBytes);
+        }
+        chunks.push(value);
+      }
+    } catch {
+      return this.json({ error: "Could not read the request body." }, 400);
+    }
+
+    const body = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      body.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return body;
+  }
+
+  private tooLarge(maxBytes: number): Response {
+    return this.json(
+      {
+        error: `Request body is too large. This endpoint accepts at most ${maxBytes} bytes.`,
+        code: "request_body_too_large",
+      },
+      413,
+    );
+  }
+
+  /**
+   * Management routes used to read the body before looking at credentials, so
+   * an anonymous caller could make the proxy buffer an arbitrary amount of data
+   * and get a 401 only afterwards. Reject on the headers first.
+   */
+  private missingManagementAuth(): Response {
+    return this.json({ error: MISSING_MANAGEMENT_AUTH }, 401);
+  }
+
+  /**
+   * LLM/SSE streams can sit quiet for minutes while the upstream model reasons,
+   * so the idle timeout has to be lifted for them. It is lifted only after the
+   * caller has authenticated: an anonymous request should still hit Bun's
+   * default timeout rather than parking a socket indefinitely.
+   */
+  private holdConnectionOpen(ctx: RequestContext | undefined, req: Request): void {
+    ctx?.server?.timeout(req, 0);
+  }
+
+  /**
+   * The first-admin slot is claimable only with the startup token. Saying so
+   * plainly beats a generic 403, because the fix is "copy the token from the
+   * app log".
+   */
+  private bootstrapTokenRequired(): Response {
+    return this.json(
+      {
+        error:
+          "This instance has no registered npub, so the first admin must be claimed with " +
+          `the bootstrap token: send it as the ${BOOTSTRAP_TOKEN_HEADER} header. ` +
+          "The token is printed in the app log at startup, or set it yourself with " +
+          "ROUTSTRD_AUTH_BOOTSTRAP_TOKEN.",
+        code: "bootstrap_token_required",
+      },
+      403,
+    );
   }
 
   /**
@@ -244,7 +418,13 @@ export class AuthProxy {
     }
 
     try {
-      const { pubkey } = await validateNIP98Request(authorization, req, body);
+      const { pubkey, event } = await validateNIP98Request(
+        authorization,
+        req,
+        body,
+        this.config.publicUrl,
+        this.authNow,
+      );
 
       const entry = this.store.getNpubByPubkey(pubkey);
       if (!entry) {
@@ -261,8 +441,16 @@ export class AuthProxy {
         }, 403);
       }
 
+      // No await between admission and returning authorization: duplicates cannot
+      // both pass, and unregistered/insufficient-role callers never occupy space.
+      this.replayCache.consume(event);
       return { pubkey, npub: entry.npub, role: entry.role };
     } catch (err) {
+      if (err instanceof ReplayError) {
+        return this.json({ error: err.message, code: err.code },
+          err.code === "nip98_replayed" ? 401 : 503,
+          err.retryAfter ? { "Retry-After": String(err.retryAfter) } : undefined);
+      }
       return this.json({
         error: err instanceof Error ? err.message : "Invalid NIP-98 token.",
       }, 401);
@@ -452,12 +640,18 @@ export class AuthProxy {
   }
 
   private async handleClients(req: Request, path: string): Promise<Response> {
-    const body = req.method === "GET" || req.method === "HEAD"
-      ? undefined
-      : new Uint8Array(await req.arrayBuffer());
+    let body: Uint8Array | undefined;
+    if (!(req.method === "GET" || req.method === "HEAD")) {
+      // Credentials are checked on the headers, before any body is read: an
+      // unauthenticated caller must not be able to make us buffer a payload.
+      if (!requestAuthorization(req)) return this.missingManagementAuth();
+      const read = await this.readBody(req);
+      if (read instanceof Response) return read;
+      body = read;
+    }
     const auth = await this.authenticateNpub(
       req,
-      req.headers.get("authorization"),
+      requestAuthorization(req),
       body,
       "user",
     );
@@ -614,6 +808,7 @@ export class AuthProxy {
       // whether an admin already exists. Requiring a *registered* npub here
       // deadlocks bootstrap (nothing is registered yet), so when the store is
       // empty accept any valid NIP-98 event and return an empty list.
+      // Read-only bootstrap lookup is deliberately exempt from replay admission.
       if (this.store.countNpubs() === 0) {
         if (!authorization) {
           return this.json({
@@ -627,7 +822,13 @@ export class AuthProxy {
           }, 401);
         }
         try {
-          await validateNIP98Request(authorization, req, undefined);
+          await validateNIP98Request(
+            authorization,
+            req,
+            undefined,
+            this.config.publicUrl,
+            this.authNow,
+          );
         } catch (err) {
           return this.json({
             error: err instanceof Error ? err.message : "Invalid NIP-98 token.",
@@ -664,14 +865,27 @@ export class AuthProxy {
     }
 
     if (req.method === "POST" && path === "/npubs") {
-      const body = new Uint8Array(await req.arrayBuffer());
       const anyNpubs = this.store.countNpubs() > 0;
+
+      // Decide authorisation from the headers, before reading the body: either
+      // an admin's NIP-98 credential, or the one-time bootstrap token while the
+      // store is still empty. Nothing is buffered until one of them is present.
+      if (anyNpubs) {
+        if (!requestAuthorization(req)) return this.missingManagementAuth();
+      } else if (!this.hasValidBootstrapToken(req)) {
+        return this.bootstrapTokenRequired();
+      }
+
+      const read = await this.readBody(req);
+      if (read instanceof Response) return read;
+      const body = read;
+
       let createdBy: string | null = null;
 
       if (anyNpubs) {
         const auth = await this.authenticateNpub(
           req,
-          req.headers.get("authorization"),
+          requestAuthorization(req),
           body,
           "admin",
         );
@@ -702,6 +916,10 @@ export class AuthProxy {
         }, 409);
       }
 
+      // The bootstrap window closes with the first successful registration, so
+      // the token stops working whether or not it came from the environment.
+      if (!anyNpubs) this.bootstrapToken = null;
+
       return this.json({
         npub: entry.npub,
         pubkey: entry.pubkey,
@@ -713,12 +931,13 @@ export class AuthProxy {
     }
 
     if (req.method === "DELETE" && (path === "/npubs" || path.startsWith("/npubs/"))) {
-      const body = req.method === "GET" || req.method === "HEAD"
-        ? undefined
-        : new Uint8Array(await req.arrayBuffer());
+      if (!requestAuthorization(req)) return this.missingManagementAuth();
+      const read = await this.readBody(req);
+      if (read instanceof Response) return read;
+      const body = read.byteLength > 0 ? read : undefined;
       const auth = await this.authenticateNpub(
         req,
-        req.headers.get("authorization"),
+        requestAuthorization(req),
         body,
         "admin",
       );
@@ -743,15 +962,32 @@ export class AuthProxy {
         return this.json({ error: "Provide the npub/pubkey to remove in /npubs/<npub>, ?npub=..., or the JSON body." }, 400);
       }
 
+      const target = this.store.getNpubByPubkey(pubkey);
+      if (!target) return this.json({ removed: false });
+
+      // Emptying the admin list locks out management. No await separates
+      // this count check from the write in this single-process handler.
+      // Bootstrap is separately token-gated; this guard prevents administrative lockout.
+      if (target.role === "admin" && this.store.countNpubs("admin") <= 1) {
+        return this.json({
+          error:
+            "Refusing to remove the last admin. Add another admin first, then remove this one.",
+          code: "last_admin",
+        }, 409);
+      }
+
       const removed = this.store.removeNpub(pubkey);
       return this.json({ removed });
     }
 
     if (req.method === "PATCH" && path === "/npubs") {
-      const body = new Uint8Array(await req.arrayBuffer());
+      if (!requestAuthorization(req)) return this.missingManagementAuth();
+      const read = await this.readBody(req);
+      if (read instanceof Response) return read;
+      const body = read;
       const auth = await this.authenticateNpub(
         req,
-        req.headers.get("authorization"),
+        requestAuthorization(req),
         body,
         "admin",
       );
@@ -769,6 +1005,18 @@ export class AuthProxy {
           error:
             "Missing required field. Provide 'role', 'name', and/or 'monthlyLimitSats' to update.",
         }, 400);
+      }
+
+      // Demoting the last admin is the same lockout as deleting it.
+      if (parsed.role === "user") {
+        const current = this.store.getNpubByPubkey(parsed.pubkey);
+        if (current?.role === "admin" && this.store.countNpubs("admin") <= 1) {
+          return this.json({
+            error:
+              "Refusing to demote the last admin. Promote another npub to admin first.",
+            code: "last_admin",
+          }, 409);
+        }
       }
 
       const updated = this.store.updateNpub(parsed.pubkey, {
@@ -798,17 +1046,17 @@ export class AuthProxy {
   }
 
   /** Handle a single incoming request. */
-  async handle(req: Request): Promise<Response> {
+  async handle(req: Request, ctx?: RequestContext): Promise<Response> {
     const res = req.method === "OPTIONS"
       ? new Response(null, { status: 204 })
-      : await this.route(req);
+      : await this.route(req, ctx);
     for (const [name, value] of Object.entries(AuthProxy.CORS_HEADERS)) {
       res.headers.set(name, value);
     }
     return res;
   }
 
-  private async route(req: Request): Promise<Response> {
+  private async route(req: Request, ctx?: RequestContext): Promise<Response> {
     const url = new URL(req.url);
     const path = url.pathname;
     const authorization = requestAuthorization(req);
@@ -874,7 +1122,30 @@ export class AuthProxy {
         return this.json({ error: "Invalid API key." }, 401);
       }
 
+      this.holdConnectionOpen(ctx, req);
+
       const clientNpub = this.resolveClientNpub(client);
+      if (client.ownerNpub && !clientNpub) {
+        // Removing an npub is the operation an operator reaches for to cut
+        // someone off. The key itself lives in the daemon's storage and keeps
+        // authenticating, so the only place access actually stops is here: a
+        // key whose recorded owner is no longer registered is refused.
+        //
+        // Clients created before `ownerNpub` existed carry no owner and are
+        // still attributed by the npub suffix, so they are unaffected -- the
+        // suffix is the only signal they have.
+        return this.json({
+          // Deliberately does not offer 're-create the client' as a remedy: the
+          // owner is recorded at creation, so a replacement key is owned by
+          // whoever creates it and is capped against their limit, not the
+          // original owner's. Re-registering the npub is the action that
+          // restores this key, so name only that.
+          error:
+            "This API key belongs to an npub that is no longer registered, so it no longer works. " +
+            "An admin can restore it by registering that npub again.",
+          code: "client_owner_not_registered",
+        }, 403);
+      }
       if (clientNpub) {
         const blocked = this.quotaResponse(clientNpub, req);
         if (blocked) return blocked;
@@ -913,6 +1184,8 @@ export class AuthProxy {
       );
       if (auth instanceof Response) return auth;
 
+      this.holdConnectionOpen(ctx, req);
+
       const overQuota = this.quotaResponse(auth.pubkey, req, true);
       if (overQuota) return overQuota;
 
@@ -931,17 +1204,48 @@ export class AuthProxy {
   /** Start the Bun HTTP server. */
   serve() {
     const { port, host } = this.config;
+    console.log(`  NIP-98 replay cache capacity: ${this.config.replayCacheMax ?? DEFAULT_REPLAY_CACHE_MAX}`);
     const npubCount = this.store.countNpubs();
     console.log(`routstrd-auth proxy listening on http://${host}:${port}`);
     console.log(`  Upstream: ${this.config.upstream}`);
     console.log(`  DB path:  ${this.config.dbPath}`);
     console.log(`  Registered npubs: ${npubCount}`);
     console.log(`  Model allowlist: ${this.config.modelAllowlistEnabled ? "enabled" : "disabled"}`);
-    if (npubCount === 0) {
+    if (this.config.publicUrl) {
+      console.log(`  NIP-98 URL binding: ${this.config.publicUrl} (ROUTSTRD_AUTH_PUBLIC_URL or CLOUDRON_APP_ORIGIN)`);
+    } else {
       console.warn(
-        "  Warning: no registered npub/pubkey. " +
-          "The first admin can be registered without auth using POST /npubs.",
+        "  Warning: neither ROUTSTRD_AUTH_PUBLIC_URL nor CLOUDRON_APP_ORIGIN is set. NIP-98 requests are bound to the " +
+          "URL implied by the request's Host / x-forwarded-* headers, which the caller " +
+          "supplies. Set it to the app's public URL unless a proxy in front overwrites them.",
       );
+    }
+    if (npubCount === 0) {
+      const token = this.bootstrapToken;
+      if (this.config.bootstrapToken) {
+        console.warn(
+          "  Warning: no registered npub/pubkey. The first admin is claimable with " +
+            `the token from ROUTSTRD_AUTH_BOOTSTRAP_TOKEN (${BOOTSTRAP_TOKEN_HEADER} header).`,
+        );
+      } else if (token) {
+        console.warn("  Warning: no registered npub/pubkey. The first admin must be claimed with this one-time token:");
+        console.warn("");
+        console.warn(`    ${token}`);
+        console.warn("");
+        console.warn(
+          `  Send it as the ${BOOTSTRAP_TOKEN_HEADER} header along with the npub, e.g.:`,
+        );
+        console.warn(`    curl -X POST https://<your-app>/npubs -H 'Content-Type: application/json'`);
+        console.warn(`    -H '${BOOTSTRAP_TOKEN_HEADER}: ${token}'`);
+        console.warn(`    -d '{"npub":"npub1...","name":"Your Name"}'`);
+        console.warn("  The token is single-use: the first successful claim voids it.");
+      } else {
+        console.warn(
+          "  Warning: no registered npub/pubkey and no bootstrap token. Set " +
+            "ROUTSTRD_AUTH_BOOTSTRAP_TOKEN and restart to claim the first admin, or " +
+            "register one with 'routstrd npubs register' from the Cloudron terminal.",
+        );
+      }
     }
 
     const unnamed = this.store.listUnnamedNpubs();
@@ -955,16 +1259,30 @@ export class AuthProxy {
       );
     }
 
+    // Keys whose owner was removed keep sitting in the daemon's storage. They
+    // are refused at the proxy now, so name them at startup rather than letting
+    // people find out from a 403 in the middle of a request.
+    if (npubCount > 0) {
+      const orphaned = this.store
+        .getClients()
+        .filter((c) => c.ownerNpub && !this.resolveClientNpub(c));
+      if (orphaned.length > 0) {
+        const shown = orphaned.slice(0, 5).map((c) => c.clientId).join(", ");
+        const more = orphaned.length > 5 ? ` (+${orphaned.length - 5} more)` : "";
+        console.warn(
+          `  Warning: ${orphaned.length} API key(s) belong to an npub that is not registered and will be refused: ${shown}${more}. ` +
+            "Re-create them with 'routstrd clients add'.",
+        );
+      }
+    }
+
     Bun.serve({
       port,
       hostname: host,
       fetch: (req, server) => {
-        // LLM/SSE streams can legitimately have long quiet periods while the
-        // upstream model reasons, retries, or waits on tooling. Bun's default
-        // 10s idle timeout closes such in-flight requests, surfacing to clients
-        // as "terminated" even when the upstream stream eventually completes.
-        server.timeout(req, 0);
-        return this.handle(req);
+        // The idle timeout is lifted per request after authentication (see
+        // holdConnectionOpen); unauthenticated slow bodies keep Bun's default.
+        return this.handle(req, { server });
       },
     });
 
