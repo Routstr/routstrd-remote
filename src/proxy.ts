@@ -1,3 +1,4 @@
+import { classifyDaemonRoute } from "./daemon-routes";
 import { ReplayCache, ReplayError, nondecreasingClock, DEFAULT_REPLAY_CACHE_MAX } from "./replay-cache";
 import { normalizeNostrPubkey, type AuthProxyConfig } from "./config";
 import { validateNIP98Request } from "./nip98";
@@ -255,6 +256,8 @@ export class AuthProxy {
         method: req.method,
         headers,
         body: requestBody,
+        // A redirect target is a new route and must pass authorization itself.
+        redirect: "manual",
       });
 
       // Tell nginx/reverse proxies not to buffer streamed responses. This is
@@ -585,10 +588,7 @@ export class AuthProxy {
   }
 
   /** Apply the monthly cap only to requests that can spend money. */
-  private quotaResponse(npub: string, req: Request, nip98 = false): Response | null {
-    if (!AuthProxy.isPaidRequest(req.method, new URL(req.url).pathname)) {
-      return null;
-    }
+  private quotaResponse(npub: string, nip98 = false): Response | null {
     if (nip98) {
       const entry = this.store.getNpubByPubkey(npub);
       if (entry && entry.monthlyLimitSats !== null) {
@@ -1071,11 +1071,12 @@ export class AuthProxy {
       return this.handleNpubs(req, path);
     }
 
-    if (path === "/clients" || path === "/clients/add" || path === "/clients/delete") {
+    const access = classifyDaemonRoute(req.method, path);
+    if (access === "proxy" && (path === "/clients" || path === "/clients/add" || path === "/clients/delete")) {
       return this.handleClients(req, path);
     }
 
-    if (path === "/usage" || path === "/usage/summary") {
+    if (access === "proxy" && (path === "/usage" || path === "/usage/summary")) {
       return this.handleUsage(req);
     }
 
@@ -1089,14 +1090,18 @@ export class AuthProxy {
       return this.json({ error: "Not found." }, 404);
     }
 
-    // Reads only: the daemon routes a POST to these paths as a paid request.
-    const isPublicPath =
-      (req.method === "GET" || req.method === "HEAD") &&
-      AuthProxy.isPublicPath(path);
+    if (access === "public") return this.forward(req);
 
-    // --- Public path: forward immediately ---
-    if (isPublicPath) {
-      return this.forward(req);
+    // Unknown routes must never fall through to member access, even for a
+    // valid administrator. Preserve the credential-specific denial for keys.
+    const bearerMatch = authorization?.match(/^Bearer\s+(.+)$/i);
+    if (bearerMatch && access !== "inference") {
+      return this.json({
+        error: "API keys can access inference endpoints only. Use NIP-98 auth with the required role.",
+      }, 403);
+    }
+    if (access !== "member" && access !== "admin" && access !== "inference") {
+      return this.json({ error: "Not found.", code: "route_not_supported" }, 404);
     }
 
     // --- Auth required ---
@@ -1108,14 +1113,7 @@ export class AuthProxy {
       }, 401);
     }
 
-    const bearerMatch = authorization.match(/^Bearer\s+(.+)$/i);
     if (bearerMatch) {
-      if (!AuthProxy.isInferencePath(req.method, path)) {
-        return this.json({
-          error: "API keys can access inference endpoints only. Use NIP-98 auth with the required role.",
-        }, 403);
-      }
-
       const apiKey = bearerMatch[1]!;
       const client = this.store.findByApiKey(apiKey);
       if (!client) {
@@ -1147,7 +1145,7 @@ export class AuthProxy {
         }, 403);
       }
       if (clientNpub) {
-        const blocked = this.quotaResponse(clientNpub, req);
+        const blocked = this.quotaResponse(clientNpub);
         if (blocked) return blocked;
       }
 
@@ -1175,7 +1173,7 @@ export class AuthProxy {
           ? undefined
           : new Uint8Array(await req.arrayBuffer());
 
-      const requiredRole = AuthProxy.isAdminPath(req.method, path) ? "admin" : "user";
+      const requiredRole = access === "admin" ? "admin" : "user";
       const auth = await this.authenticateNpub(
         req,
         authorization,
@@ -1186,8 +1184,10 @@ export class AuthProxy {
 
       this.holdConnectionOpen(ctx, req);
 
-      const overQuota = this.quotaResponse(auth.pubkey, req, true);
-      if (overQuota) return overQuota;
+      if (access === "inference") {
+        const overQuota = this.quotaResponse(auth.pubkey, true);
+        if (overQuota) return overQuota;
+      }
 
       const blocked = this.checkModelAllowlist(body, req.method);
       if (blocked) return blocked;
@@ -1318,138 +1318,8 @@ export class AuthProxy {
     "Access-Control-Max-Age": "86400",
   };
 
-  /** Minimal public endpoints that don't require auth. */
-  static PUBLIC_PATHS = new Set([
-    "/health",
-    "/ping",
-    "/models",
-    "/v1/models",
-  ]);
-
-  /** Public path prefixes. */
-  static PUBLIC_PREFIXES = ["/models/", "/v1/models/"];
-
-  /** Endpoints that are admin-only for every method. */
-  static ADMIN_PATHS = new Set([
-    // ── Moving value ────────────────────────────────────────────────────────
-    "/wallet/send/cashu",
-    "/wallet/send/bolt11",
-    // Reclaims the proofs behind offline sends that were never claimed. The
-    // daemon refuses it without `confirmed: true` precisely because unclaimed
-    // tokens are invalidated, so it moves value like a send does.
-    "/wallet/sweep-offline",
-    // Re-issues paid mint quotes nobody ever claimed. It recovers money, but it
-    // does so by minting against the wallet, so it is not a read.
-    "/wallet/recover",
-    "/wallet/recover/operations",
-
-    // ── Wallet integrity ────────────────────────────────────────────────────
-    // Gates the wallet's spending state. Without it nothing else in this list
-    // is reachable anyway, so gating it is what makes the rest mean anything.
-    "/wallet/unlock",
-    // The only route that marks proofs spent without a matching swap, which is
-    // exactly how a proof gets destroyed rather than moved.
-    "/wallet/cleanup",
-    // Despite the name this is not a read. With `dryRun` omitted -- the default
-    // -- it asks every mint about all ready and inflight proofs and writes
-    // `spent` for the ones the mint reports, which reclaims balance and, via
-    // `proofs:state-changed`, finalizes send operations that had reserved those
-    // inflight proofs. The CLI's "are you sure" prompt lives in the client, so
-    // the proxy cannot rely on it; unlike `/wallet/sweep-offline` the daemon has
-    // no `confirmed` guard here, so a bare `POST {}` applies immediately.
-    "/wallet/check-proofs",
-
-    // ── Provider credentials ────────────────────────────────────────────────
-    // `GET /keys/api` returns every upstream provider key in plaintext.
-    "/keys/api",
-    "/keys/api/delete",
-  ]);
-
-  /**
-   * Endpoints that are admin-only for some methods but readable by any
-   * registered npub for others.
-   *
-   * routstrd answers GET and POST on the same path for its wallet resources, so
-   * a path-only gate cannot express "changing this is admin work, reading it is
-   * not". The mint set is the case that matters: adding a mint or moving the
-   * default decides which mints the wallet trusts, but `routstrd wallet mints
-   * list` must keep working for a non-admin. `/wallet/mints/info` is a
-   * stateless lookup on a URL the caller supplies, so it stays off this list.
-   */
-  static ADMIN_METHODS: ReadonlyMap<string, ReadonlySet<string>> = new Map<
-    string,
-    ReadonlySet<string>
-  >([
-    ["/wallet/mints", new Set(["POST"])],
-    ["/wallet/mints/default", new Set(["POST"])],
-  ]);
-
-  /**
-   * Admin-only path prefixes, for daemon routes that carry a parameter.
-   *
-   * `POST /wallet/send/cashu/<operationId>/mark-spent` settles an offline send
-   * (routstrd 0.5.0). It cannot live in `ADMIN_PATHS` because the operation id
-   * varies, and leaving it out would put settlement below sending: a plain
-   * registered npub cannot send cashu but could mark someone else's send spent.
-   *
-   * The trailing slash keeps `/wallet/send/cashuX` from matching.
-   */
-  static ADMIN_PREFIXES = ["/wallet/send/cashu/"];
-
-  /**
-   * Mirror of Routstr Core's `_ALLOWED_ENDPOINTS` (routstr/proxy.py), which is
-   * the authoritative gate for which method/path pairs may reach an upstream
-   * with the provider credential attached. Core refuses everything outside that
-   * table, so anything listed there is safe for a client key to reach and
-   * anything missing there is dead weight here. Keep the two tables in sync.
-   *
-   * Deliberate differences from core:
-   * - `attestation` / `tee/attestation` are omitted. Core forwards those
-   *   unauthenticated (`_select_unauthenticated_get_upstreams`), so they belong
-   *   in `PUBLIC_PATHS`, not in a client-key capability list.
-   * - `models` is listed for parity, but `PUBLIC_PATHS` already covers it, so a
-   *   GET never reaches the client-key branch. It is GET-only here exactly as
-   *   in core, which is why `POST /v1/models` stays a 403.
-   *
-   * Core also accepts operator additions via `PROXY_EXTRA_ALLOWED_PATHS`; this
-   * proxy has no equivalent and rejects anything not listed below.
-   */
-  static INFERENCE_ENDPOINTS: ReadonlyMap<string, ReadonlySet<string>> = new Map<
-    string,
-    ReadonlySet<string>
-  >([
-    ["chat/completions", new Set(["POST"])],
-    ["completions", new Set(["POST"])],
-    ["responses", new Set(["POST"])],
-    ["messages", new Set(["POST"])],
-    // Anthropic token counting. Core's allowlist is exact, so the `messages`
-    // entry above does not carry it; Claude Code and the Anthropic SDKs call it
-    // before every request.
-    ["messages/count_tokens", new Set(["POST"])],
-    ["embeddings", new Set(["POST"])],
-    ["systemone", new Set(["POST"])],
-    ["decisions", new Set(["POST"])],
-    ["images/generations", new Set(["POST"])],
-    ["images/edits", new Set(["POST"])],
-    ["images/variations", new Set(["POST"])],
-    ["image/generate", new Set(["POST"])],
-    ["image/edit", new Set(["POST"])],
-    ["image/inpaint", new Set(["POST"])],
-    ["image/upscale", new Set(["POST"])],
-    ["models", new Set(["GET"])],
-  ]);
-
-  static isPublicPath(path: string): boolean {
-    if (AuthProxy.PUBLIC_PATHS.has(path)) return true;
-    return AuthProxy.PUBLIC_PREFIXES.some((prefix) => path.startsWith(prefix));
-  }
-
   static isAdminPath(method: string, path: string): boolean {
-    return (
-      AuthProxy.ADMIN_PATHS.has(path) ||
-      (AuthProxy.ADMIN_METHODS.get(path)?.has(method.toUpperCase()) ?? false) ||
-      AuthProxy.ADMIN_PREFIXES.some((prefix) => path.startsWith(prefix))
-    );
+    return classifyDaemonRoute(method, path) === "admin";
   }
 
   /**
@@ -1466,37 +1336,7 @@ export class AuthProxy {
   }
 
   static isInferencePath(method: string, path: string): boolean {
-    return (
-      AuthProxy.INFERENCE_ENDPOINTS.get(
-        AuthProxy.canonicalApiPath(path),
-      )?.has(method.toUpperCase()) ?? false
-    );
-  }
-
-  /**
-   * Routes that never spend from the wallet: proxy-managed npub/client/usage
-   * endpoints and the daemon's own wallet, NWC, settings, provider, key and
-   * control routes. Any other POST falls through to the paid inference proxy.
-   */
-  static NON_PAID_PREFIXES = [
-    "/npubs",
-    "/clients",
-    "/usage",
-    "/wallet",
-    "/nwc",
-    "/settings",
-    "/providers",
-    "/cooldowns",
-    "/keys",
-    "/stop",
-    "/refund",
-  ];
-
-  /** True for requests that can incur inference spend. */
-  static isPaidRequest(method: string, path: string): boolean {
-    if (method !== "POST") return false;
-    return !AuthProxy.NON_PAID_PREFIXES.some(
-      (prefix) => path === prefix || path.startsWith(`${prefix}/`),
-    );
+    return classifyDaemonRoute(method, path) === "inference" ||
+      (method.toUpperCase() === "GET" && (path === "/models" || path === "/v1/models"));
   }
 }

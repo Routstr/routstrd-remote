@@ -1,18 +1,6 @@
 import { validateNIP98Request } from "./nip98";
 import type { Client } from "./store";
-
-/**
- * Public endpoints that don't require auth.
- * Everything else is default-deny and requires Bearer or NIP-98 auth.
- */
-const PUBLIC_PATHS = new Set([
-  "/health",
-  "/ping",
-  "/models",
-  "/v1/models",
-]);
-
-const PUBLIC_PREFIXES = ["/models/", "/v1/models/"];
+import { classifyDaemonRoute } from "./daemon-routes";
 
 /** Authorization takes precedence, including malformed or invalid credentials.
  * Only requests without that header may use Anthropic's x-api-key carrier.
@@ -32,9 +20,8 @@ export interface AuthResult {
   isPublicPath: boolean;
 }
 
-export function isPublicPath(path: string): boolean {
-  if (PUBLIC_PATHS.has(path)) return true;
-  return PUBLIC_PREFIXES.some((prefix) => path.startsWith(prefix));
+export function isPublicPath(path: string, method = "GET"): boolean {
+  return classifyDaemonRoute(method, path) === "public";
 }
 
 /**
@@ -85,7 +72,7 @@ export async function authenticateRequest(
   findClient: (apiKey: string) => Client | null,
   body?: Uint8Array,
 ): Promise<AuthResult> {
-  if (isPublicPath(path)) {
+  if (isPublicPath(path, req.method)) {
     return { authenticated: true, isPublicPath: true };
   }
 
