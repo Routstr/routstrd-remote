@@ -1,9 +1,12 @@
 #!/bin/sh
 set -e
+umask 077
 
 # Ensure data directories exist for routstrd
 export ROUTSTRD_DIR="${ROUTSTRD_DIR:-/data/routstrd}"
 mkdir -p "$ROUTSTRD_DIR" /data/logs
+# Repair existing credentials before rewriting config or starting the daemon.
+chmod -R go-rwx -- "$ROUTSTRD_DIR"
 
 # routstrd stays local to the container. routstrd-auth is the public service.
 ROUTSTRD_PORT="${ROUTSTRD_PORT:-${PORT:-8008}}"
@@ -55,9 +58,6 @@ bun -e '
 
   await Bun.write(configPath, JSON.stringify(config, null, 2) + "\n");
 ' "${ROUTSTRD_CONFIG}" "${AUTH_URL}"
-
-# config.json holds the container nsec; Bun.write() leaves it at 0644.
-chmod -R go-rwx "$ROUTSTRD_DIR" 2>/dev/null || true
 
 _term() {
   echo "Shutting down..."

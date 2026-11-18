@@ -11,10 +11,8 @@ USER root
 # x64 Bun binary can crash there with SIGILL ("Illegal instruction").
 ARG BUN_VERSION=1.4.4
 ARG BUN_TARGET=bun-linux-x64-baseline
-# Published SHA-256 of ${BUN_TARGET}.zip for ${BUN_VERSION}. The download is the
-# one executable input to this build that is not pinned by a digest or a
-# version resolver, so it is verified before it is unpacked and run. Bumping
-# BUN_VERSION without updating this fails the build on purpose.
+# Refresh when changing BUN_VERSION or BUN_TARGET, using the matching entry in
+# https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/SHASUMS256.txt
 ARG BUN_SHA256=e0446eb55995772eb9894bebae9a6be368d985a8b9271ee124486f9946eedd76
 ENV BUN_INSTALL=/usr/local/bun
 ENV ROUTSTRD_DIR=/app/data/routstrd

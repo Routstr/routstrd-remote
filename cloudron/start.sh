@@ -1,19 +1,26 @@
 #!/bin/bash
 set -eu
+# Onboarding and the supervised services must create secrets owner-only.
+umask 077
 
 echo "==> Preparing persistent data directory..."
 mkdir -p /app/data/logs
 chown -R cloudron:cloudron /app/data
 
-# Make Cloudron defaults visible to every child process. Users can still
-# override these through Cloudron environment variables if needed.
+# Use the same persistent paths as the packaged Supervisor programs.
 export HOME="/app/data"
-export ROUTSTRD_DIR="${ROUTSTRD_DIR:-/app/data/routstrd}"
+export ROUTSTRD_DIR="/app/data/routstrd"
 export ROUTSTRD_AUTH_HOST="${ROUTSTRD_AUTH_HOST:-0.0.0.0}"
 export ROUTSTRD_AUTH_PORT="${ROUTSTRD_AUTH_PORT:-8008}"
 export ROUTSTRD_PORT="${ROUTSTRD_PORT:-8009}"
 export ROUTSTRD_UPSTREAM="${ROUTSTRD_UPSTREAM:-http://localhost:${ROUTSTRD_PORT}}"
-export ROUTSTRD_DB_PATH="${ROUTSTRD_DB_PATH:-/app/data/routstrd/routstr.db}"
+export ROUTSTRD_DB_PATH="${ROUTSTRD_DIR}/routstr.db"
+
+# Repair older volumes before any secrets are read or rewritten. A failed
+# repair must stop startup rather than silently leave old credentials exposed.
+if [[ -d "${ROUTSTRD_DIR}" ]]; then
+    gosu cloudron:cloudron chmod -R go-rwx -- "${ROUTSTRD_DIR}"
+fi
 
 # First run: initialize the Cashu wallet. routstrd does not create the wallet
 # directory/config on its own, so on a fresh data directory the daemon
@@ -81,13 +88,6 @@ bun -e '
 # create logs/, wallet/, etc. inside it. Reclaim ownership of the whole data
 # directory, not just config.json.
 chown -R cloudron:cloudron /app/data
-
-# Everything under ${ROUTSTRD_DIR} is secret: config.json holds the container
-# nsec, wallet/config.json holds the Cashu wallet material, and routstr.db holds
-# every client API key in plaintext. Only the cloudron user needs to read any of
-# it, and /app/data is included in Cloudron's backups. Bun.write() leaves
-# config.json at 0644 (umask), so narrow it here on every start.
-chmod -R go-rwx "${ROUTSTRD_DIR}" 2>/dev/null || true
 
 echo "==> Starting supervisord..."
 exec /usr/bin/supervisord --configuration /etc/supervisor/supervisord-cloudron.conf -i RoutstrdApp
