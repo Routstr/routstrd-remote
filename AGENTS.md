@@ -160,7 +160,7 @@ IMG="ghcr.io/sh1ftred/routstrd-pro:$TAG"
 podman build -t "$IMG" . 2>&1 | tee /tmp/build.log
 ```
 
-`./scripts/publish-image.sh` does build → versions printout → **security gate** →
+`./scripts/publish-image.sh` does build → versions printout → **daemon route gate** → **Trivy gate** →
 push in one shot, so the gate cannot be skipped by accident. The manual steps below
 are what it runs; use them only when debugging it.
 
@@ -179,6 +179,43 @@ podman run --rm --entrypoint /bin/sh "$IMG" -c \
 
 If these disagree with the changelog line, fix the changelog (rebuild only if the
 dependency itself is wrong).
+
+### Daemon route gate (blocking, also with `--no-build`)
+
+Run `./scripts/check-daemon-routes.sh "$IMG"`. It checks the installed package
+version and the SHA-256 of the exact `dist/daemon/index.js` run by Supervisor,
+then compares the image's runtime policy against the independently reviewed
+inventory (`scripts/reviewed/daemon-routes.json`). The image's `src/proxy.ts` and
+`src/daemon-routes.ts` must also match the release checkout. No registry fetch,
+wallet, or running daemon is needed. A historical image without the policy
+cannot pass by reusing today's checkout. `--gate none` changes Trivy behavior
+only; there is no route gate override.
+
+When bumping routstrd, **do not just refresh the digest**. The 0.5.0 router has
+inline branches, not a machine-readable route table. Inspect the exact installed
+package's `src/daemon/http/index.ts` and the compiled dispatcher (including new
+helpers, aliases, method branches and fallthroughs). Record all named operations
+as `METHOD /path` with `:id` for a single segment. Add a corresponding runtime
+policy entry, including `proxy` for locally mediated routes or `unsupported` for
+routes intentionally not exposed. The daemon's global OPTIONS and generic
+provider fallback are not finite named operations: the proxy handles preflight
+locally and separately enumerates allowed inference operations. Do not add a
+public/member wildcard to match the daemon's fallback.
+
+Once reviewed, update the version, inventory and bundle hash together. To
+inspect the candidate without starting it:
+
+```bash
+podman run --rm --pull never --network none --entrypoint sh "$IMG" -ec '
+  cd /usr/local/bun/install/global/node_modules/routstrd
+  /usr/local/bin/bun -p "require(\"./package.json\").version"
+  sha256sum dist/daemon/index.js'
+```
+
+Run `bun test` and re-run the route gate on the final release image. A rebuilt
+bundle (even at the same version) requires review; a new layout with more than
+one executable dispatcher artifact requires extending the gate before publishing.
+This is an image check, not catalog registration or publication (see step 9b).
 
 ### Step 5b — Security gate (blocking)
 
