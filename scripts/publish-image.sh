@@ -2,7 +2,7 @@
 #
 # scripts/publish-image.sh — build, gate, then push the Cloudron image.
 #
-# The order is the point: the Trivy gate (scripts/security-scan.sh) runs on the
+# The order is the point: the route inventory and Trivy gates run on the
 # exact image that would be published, and a failing gate aborts before
 # `podman push`, so a vulnerable image never becomes pullable and can never be
 # registered in CloudronVersions.json. Also prints the bundled routstrd /
@@ -54,6 +54,10 @@ echo "==> Bundled versions in $IMAGE (verify against the CHANGELOG entry)"
 podman run --rm --entrypoint /usr/local/bin/routstrd "$IMAGE" --version || true
 podman run --rm --entrypoint /bin/sh "$IMAGE" -c \
     'grep -m1 "\"version\"" /usr/local/bun/install/global/node_modules/@routstr/sdk/package.json' || true
+
+echo
+echo "==> Daemon route inventory gate"
+"$REPO_ROOT/scripts/check-daemon-routes.sh" "$IMAGE"
 
 echo
 echo "==> Security gate"

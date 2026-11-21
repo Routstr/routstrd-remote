@@ -41,21 +41,49 @@ function firstHeaderValue(value: string | null): string | null {
   return value?.split(",", 1)[0]?.trim() || null;
 }
 
-function getAbsoluteRequestUrl(req: Request): string {
-  // Bun's Request.url is already absolute. Honor common reverse-proxy headers so
-  // deployments behind TLS/load-balancers can validate the public URL clients
-  // actually signed.
+/**
+ * The URL a NIP-98 event must have signed.
+ *
+ * The configured public URL (explicit override or Cloudron origin) wins: the signed `u` tag then binds
+ * to a value the operator controls, and the forwarding headers below are not
+ * consulted at all. Without it we fall back to the request's own URL, patched
+ * with `x-forwarded-*` so deployments behind TLS/load-balancers can validate
+ * the URL clients actually signed.
+ *
+ * That fallback trusts headers the caller supplies. A proxy that appends rather
+ * than replaces them (or direct access to the app port) lets a caller present
+ * any host it likes, which defeats the binding and turns a NIP-98 event signed
+ * for some other service into a credential here. Configure a public URL wherever the
+ * proxy does not overwrite these headers itself.
+ */
+function getAbsoluteRequestUrl(req: Request, publicUrl?: string | null): string {
   const url = new URL(req.url);
+
+  if (publicUrl) {
+    const expected = new URL(publicUrl);
+    // Assign components: a leading // must not replace the configured authority.
+    expected.pathname = url.pathname;
+    expected.search = url.search;
+    return expected.toString();
+  }
+
   const forwardedProto = firstHeaderValue(req.headers.get("x-forwarded-proto"));
   const forwardedHost = firstHeaderValue(req.headers.get("x-forwarded-host"));
   const host = firstHeaderValue(req.headers.get("host"));
 
-  if (forwardedProto) url.protocol = forwardedProto.endsWith(":")
-    ? forwardedProto
-    : `${forwardedProto}:`;
-  if (forwardedHost || host) url.host = forwardedHost ?? host!;
+  // Rebuild rather than assigning `url.host`: the host setter keeps the
+  // original port when the new value has none, so a forwarded host of
+  // "routstr.example.com" would otherwise produce
+  // "https://routstr.example.com:8008/..." and reject every correctly signed
+  // event from a proxy that talks to us on an internal port.
+  const proto = (forwardedProto ?? url.protocol).replace(/:$/, "");
+  const authority = forwardedHost ?? host ?? url.host;
 
-  return url.toString();
+  try {
+    return new URL(`${proto}://${authority}${url.pathname}${url.search}`).toString();
+  } catch {
+    throw new Error("Invalid forwarding headers for NIP-98 URL binding.");
+  }
 }
 
 function decodeAuthorizationEvent(authorization: string): Event {
@@ -87,16 +115,21 @@ function decodeAuthorizationEvent(authorization: string): Event {
 }
 
 /**
- * Validate an `Authorization: Nostr ...` request according to NIP-98.
+ * Validate an `Authorization: Nostr <base64-event>` request according to NIP-98.
  *
  * The signed event must bind to the exact public request URL and method. If the
  * request has a non-empty body, a `payload` tag containing the SHA-256 hex hash
  * of the raw request body is required and must match.
+ *
+ * Pass `publicUrl` (from `ROUTSTRD_AUTH_PUBLIC_URL`) to bind the `u` tag to a
+ * configured origin instead of trusting the request's forwarding headers.
  */
 export async function validateNIP98Request(
   authorization: string,
   req: Request,
   body?: Uint8Array,
+  publicUrl?: string | null,
+  nowSeconds: () => number = () => Math.round(Date.now() / 1000),
 ): Promise<NIP98ValidationResult> {
   const event = decodeAuthorizationEvent(authorization);
 
@@ -108,14 +141,10 @@ export async function validateNIP98Request(
     throw new Error("Invalid NIP-98 timestamp.");
   }
 
-  const now = Math.round(Date.now() / 1000);
-  const age = now - event.created_at;
-  if (age > NIP98_MAX_AGE_SECONDS || age < -NIP98_MAX_AGE_SECONDS) {
-    throw new Error("NIP-98 event timestamp is outside the allowed window.");
-  }
+  assertNip98Fresh(event.created_at, nowSeconds());
 
   const urlTag = getTag(event, "u");
-  if (urlTag !== getAbsoluteRequestUrl(req)) {
+  if (urlTag !== getAbsoluteRequestUrl(req, publicUrl)) {
     throw new Error("NIP-98 URL tag does not match this request.");
   }
 
@@ -140,7 +169,14 @@ export async function validateNIP98Request(
     throw new Error("Invalid NIP-98 event signature.");
   }
 
+  assertNip98Fresh(event.created_at, nowSeconds());
   return { pubkey: event.pubkey, event };
+}
+
+export function assertNip98Fresh(createdAt: number, now: number): void {
+  if (!Number.isFinite(createdAt) || Math.abs(now - createdAt) > NIP98_MAX_AGE_SECONDS) {
+    throw new Error("NIP-98 event timestamp is outside the allowed window.");
+  }
 }
 
 export function isNIP98Authorization(authorization: string | null): boolean {
