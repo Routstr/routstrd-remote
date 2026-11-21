@@ -39,7 +39,10 @@ export const DAEMON_ROUTES: readonly DaemonRoute[] = [
   // Moving/settling value, changing wallet trust or integrity, or handling
   // provider secrets requires an administrator (including check-proofs, which
   // mutates proofs by default, and recover, which reissues paid mint quotes).
-  ...routes("admin", "GET", "/keys/api"),
+  // `/wallet/parked` is a read, but it lists refund tokens the daemon parked
+  // after a failed receive, which is wallet operational state rather than
+  // anything a member needs; it backs the operator CLI's `wallet parked`.
+  ...routes("admin", "GET", "/keys/api", "/wallet/parked"),
   ...routes("admin", "DELETE", "/keys/api/delete"),
   ...routes("admin", "POST", "/keys/api/delete", "/wallet/unlock", "/wallet/sweep-offline", "/wallet/cleanup",
     "/wallet/check-proofs", "/wallet/recover", "/wallet/recover/operations", "/wallet/send/cashu",

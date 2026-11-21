@@ -1,6 +1,6 @@
 {
-  "version": "0.5.0",
-  "daemonBundleSha256": "9ca6c750705548a79002e758ebec1a1a2e74d03223058de98d2ba0281c115469",
+  "version": "0.5.2",
+  "daemonBundleSha256": "8cb12fee3101917ad1c116bd8e3704d78bfbfff7fa7d31c1826e8f771d11b979",
   "routes": [
     "DELETE /keys/api/delete",
     "GET /balance",
@@ -29,6 +29,7 @@
     "GET /wallet/mints",
     "GET /wallet/mints/default",
     "GET /wallet/npc/address",
+    "GET /wallet/parked",
     "GET /wallet/receive/bolt11/:id",
     "GET /wallet/status",
     "HEAD /v1/models",

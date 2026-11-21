@@ -191,8 +191,8 @@ wallet, or running daemon is needed. A historical image without the policy
 cannot pass by reusing today's checkout. `--gate none` changes Trivy behavior
 only; there is no route gate override.
 
-When bumping routstrd, **do not just refresh the digest**. The 0.5.0 router has
-inline branches, not a machine-readable route table. Inspect the exact installed
+When bumping routstrd, **do not just refresh the digest**. The daemon's router
+has inline branches, not a machine-readable route table. Inspect the exact installed
 package's `src/daemon/http/index.ts` and the compiled dispatcher (including new
 helpers, aliases, method branches and fallthroughs). Record all named operations
 as `METHOD /path` with `:id` for a single segment. Add a corresponding runtime
@@ -373,7 +373,7 @@ under community apps.
 1. **Unpinned `routstrd` in the Dockerfile.** `RUN bun install --global routstrd`
    takes npm `latest` at build time, so builds aren't reproducible and the bundled
    daemon can silently change between releases. Pinning it is a worthwhile fix.
-   (Now pinned to `routstrd@0.4.18` — keep it pinned and bump deliberately, the
+   (Now pinned to `routstrd@0.5.2` — keep it pinned and bump deliberately, the
    security gate scans that dependency tree.)
 2. **Repo renamed, two stale references remain.** The local `origin` remote and the
    app's `Source` field still use the `routstrd-auth` slug. Git clone/fetch/push

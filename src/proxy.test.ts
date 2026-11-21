@@ -1222,6 +1222,7 @@ describe("daemon route capability boundary", () => {
     const adminSecret = registerNpub("admin");
     const routes = [
       ["GET", "/keys/api?include=all", undefined],
+      ["GET", "/wallet/parked", undefined],
       ["POST", "/keys/api/delete", JSON.stringify({ baseUrl: "https://provider.invalid" })],
       ["DELETE", "/keys/api/delete?baseUrl=https%3A%2F%2Fprovider.invalid", undefined],
       ["POST", "/wallet/send/cashu", "{}"],
