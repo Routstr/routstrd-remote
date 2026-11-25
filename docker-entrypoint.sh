@@ -13,9 +13,9 @@ ROUTSTRD_PORT="${ROUTSTRD_PORT:-${PORT:-8008}}"
 ROUTSTRD_AUTH_PORT="${ROUTSTRD_AUTH_PORT:-8080}"
 ROUTSTRD_AUTH_HOST="${ROUTSTRD_AUTH_HOST:-0.0.0.0}"
 ROUTSTRD_UPSTREAM="${ROUTSTRD_UPSTREAM:-http://localhost:${ROUTSTRD_PORT}}"
-# No default admin npub: unset leaves the npubs table empty, and the first admin
-# is then claimed with the one-time bootstrap token (generated and logged at
-# startup, or supplied here). An unauthenticated POST /npubs is never accepted.
+# The container's own Nostr identity is seeded as the first admin below, so the
+# npubs table is never empty and the anonymous first-admin claim path is never
+# reachable. ROUTSTRD_AUTH_ADMIN_NPUBS still adds extra admins when set.
 ROUTSTRD_AUTH_ADMIN_NPUBS="${ROUTSTRD_AUTH_ADMIN_NPUBS:-}"
 ROUTSTRD_AUTH_BOOTSTRAP_TOKEN="${ROUTSTRD_AUTH_BOOTSTRAP_TOKEN:-}"
 export ROUTSTRD_AUTH_PORT ROUTSTRD_AUTH_HOST ROUTSTRD_UPSTREAM
@@ -57,7 +57,39 @@ bun -e '
   }
 
   await Bun.write(configPath, JSON.stringify(config, null, 2) + "\n");
+
+  // Hand the npub of this identity to the shell so it can be seeded as admin.
+  try {
+    const decoded = nip19.decode(config.nsec);
+    await Bun.write("/tmp/routstrd-container-npub", nip19.npubEncode(getPublicKey(decoded.data)) + "\n");
+  } catch (error) {
+    console.warn(`Warning: could not derive an npub from ${configPath}: ${error}`);
+  }
 ' "${ROUTSTRD_CONFIG}" "${AUTH_URL}"
+
+# Seed the container's own identity as admin (see cloudron/start.sh for the
+# rationale): the bundled CLI signs with this nsec, so `routstrd npubs add`
+# works from a shell in the container with nothing to copy.
+CONTAINER_NPUB=""
+if [ -s /tmp/routstrd-container-npub ]; then
+    CONTAINER_NPUB=$(tr -d '\n' < /tmp/routstrd-container-npub)
+    rm -f /tmp/routstrd-container-npub
+fi
+
+if [ -n "$CONTAINER_NPUB" ]; then
+    case ",${ROUTSTRD_AUTH_ADMIN_NPUBS}," in
+        *",${CONTAINER_NPUB},"*) ;;
+        *)
+            if [ -n "$ROUTSTRD_AUTH_ADMIN_NPUBS" ]; then
+                ROUTSTRD_AUTH_ADMIN_NPUBS="${CONTAINER_NPUB},${ROUTSTRD_AUTH_ADMIN_NPUBS}"
+            else
+                ROUTSTRD_AUTH_ADMIN_NPUBS="${CONTAINER_NPUB}"
+            fi
+            ;;
+    esac
+    export ROUTSTRD_AUTH_ADMIN_NPUBS
+    echo "The container's Nostr identity is an admin: ${CONTAINER_NPUB}"
+fi
 
 _term() {
   echo "Shutting down..."

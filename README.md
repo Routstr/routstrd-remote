@@ -34,37 +34,29 @@ All values have sensible defaults and can be overridden via environment variable
 
 ## First admin registration
 
-Starting the auth proxy does **not** automatically register the identity in `config.json` as an admin. A fresh instance has no npub at all, so the proxy generates a one-time bootstrap token and prints it at startup. Every claim of the first admin must carry that token.
+Starting the auth proxy seeds the identity in `config.json` as the first admin, so an instance has an admin from its first boot and the first-admin slot is never claimable by an anonymous caller.
 
-Copy the token from the app log (Cloudron: the app's **Logs** tab, or `docker logs <container>`):
-
-```
-Warning: no registered npub/pubkey. The first admin must be claimed with this one-time token:
-
-    q3Vt...8kQ
-
-  Send it as the x-routstr-bootstrap-token header along with the npub, e.g.:
-    curl -X POST https://<your-app>/npubs -H 'Content-Type: application/json'
-    -H 'x-routstr-bootstrap-token: q3Vt...8kQ'
-    -d '{"npub":"npub1...","name":"Your Name"}'
-```
-
-Then claim it (the first claim becomes an admin by default):
+That identity is the one routstrd itself holds and signs NIP-98 with, so the bundled CLI **is** an admin out of the box. From a shell in the container (Cloudron: the app's **Web Terminal**, or `cloudron exec --app <domain>`):
 
 ```bash
-curl -X POST "$AUTH_URL/npubs" \
-  -H 'Content-Type: application/json' \
-  -H 'x-routstr-bootstrap-token: <token from the log>' \
-  -d '{"npub":"npub1...","name":"Alice"}'
+routstrd npubs list          # shows the container's own npub, marked "→ you"
+routstrd status              # balances, daemon state
+
+# Add a person as an admin. Their npub comes from `routstrd remote <url>`
+# on their own machine.
+routstrd npubs add npub1... --role admin --name "Alice"
+
+# Optional: name the container's own identity so the startup warning stops.
+routstrd npubs update <container npub> --name "Routstr Box"
 ```
 
-The token is **single-use**: the first successful claim voids it, and the window closes for good once any npub exists. A rejected claim (bad JSON, missing `name`) does not void it. Set `ROUTSTRD_AUTH_BOOTSTRAP_TOKEN` yourself to choose the value instead; it is then not printed to the log.
+Nothing to copy out of a log, and no token: the first admin already exists, and NIP-98 from it is what authorises adding more. `ROUTSTRD_AUTH_ADMIN_NPUBS` (or `ROUTSTRD_AUTH_ADMIN_PUBKEYS`) still adds admins from outside the container, and those are re-applied at every start.
 
-Without this, the window would be open to the internet: the app is publicly reachable the moment Cloudron finishes installing it, and the first admin can send wallet funds and read every provider credential. The token is what makes "install now, configure later" safe.
+Why this is safe: the window the token used to guard existed because a freshly installed app is publicly reachable before its operator has configured anything. Seeding an admin at boot means the npub table is never empty, so `POST /npubs` always requires NIP-98 from an existing admin — the anonymous claim path is never reachable on a normal install.
 
-`routstrd npubs register` does not send this header, so the *first* admin is claimed with the `curl` above. Once an npub is registered, `GET /npubs` and `POST /npubs` go back to NIP-98 from an existing admin and the CLI works as before.
+The token machinery is still in the proxy and still works, but it is a fallback rather than the normal path: it only appears when the proxy starts with an empty npub table and no seeded admin in `ROUTSTRD_AUTH_ADMIN_NPUBS` — that is, when the app is run outside the packaged entrypoints, or when every npub has been deleted and the seed cannot be re-applied.
 
-If you delete every npub, the table is empty again and the proxy starts a new instance with no token (it only mints one while there is a window to protect). Restart the app to mint and log a new token, or set `ROUTSTRD_AUTH_BOOTSTRAP_TOKEN` and restart.
+If you delete every npub, the table is empty again until the next start re-seeds the container identity (which happens on every boot, so the window re-closes by itself). A proxy started without that seed prints a one-time token instead, as documented below.
 
 ## Cloudron
 
@@ -72,22 +64,23 @@ If you delete every npub, the table is empty again and the proxy starts a new in
 
 ### Initial Setup (first person)
 
+The app's own Nostr identity is already the first admin, so nobody has to claim a slot over HTTP. From the app's Web Terminal:
+
+```bash
+routstrd npubs add <your npub> --role admin --name "Alice"
+```
+
+Your npub comes from the CLI on your own machine:
+
 ```bash
 # Install the CLI client globally
 bun i -g routstrd
 
 # Connect to your Cloudron instance (this prints your npub)
 routstrd remote <cloudron-url>
-
-# Register yourself as the first admin. This one step uses curl because the
-# CLI does not send the bootstrap token; copy the token from the app's Logs tab.
-curl -X POST "https://<cloudron-url>/npubs" \
-  -H 'Content-Type: application/json' \
-  -H 'x-routstr-bootstrap-token: <token from the app log>' \
-  -d '{"npub":"<your npub>","name":"Alice"}'
 ```
 
-The first npub registered this way gets `admin` by default. After that, `routstrd npubs list`, `add` and `update` work from the CLI as usual.
+Then, on your machine, `routstrd npubs list`, `add` and `update` work as an admin.
 
 ```bash
 routstrd clients add --pi-agent    # for Pi Agent
