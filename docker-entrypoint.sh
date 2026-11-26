@@ -25,7 +25,7 @@ export ROUTSTRD_AUTH_ADMIN_NPUBS ROUTSTRD_AUTH_BOOTSTRAP_TOKEN
 ROUTSTRD_CONFIG="${ROUTSTRD_DIR}/config.json"
 AUTH_URL="http://localhost:${ROUTSTRD_AUTH_PORT}"
 echo "Configuring authUrl (${AUTH_URL}) and Nostr identity in ${ROUTSTRD_CONFIG}..."
-bun -e '
+CONTAINER_NPUB=$(bun -e '
   let nostrTools;
   try {
     nostrTools = await import("nostr-tools");
@@ -49,47 +49,26 @@ bun -e '
 
   config.authUrl = authUrl;
 
-  if (!config.nsec) {
-    const sk = generateSecretKey();
-    config.nsec = nip19.nsecEncode(sk);
-    const npub = nip19.npubEncode(getPublicKey(sk));
-    console.log(`Generated container Nostr identity: ${npub}`);
-  }
-
-  await Bun.write(configPath, JSON.stringify(config, null, 2) + "\n");
-
-  // Hand the npub of this identity to the shell so it can be seeded as admin.
+  if (!config.nsec) config.nsec = nip19.nsecEncode(generateSecretKey());
+  let npub;
   try {
-    const decoded = nip19.decode(config.nsec);
-    await Bun.write("/tmp/routstrd-container-npub", nip19.npubEncode(getPublicKey(decoded.data)) + "\n");
-  } catch (error) {
-    console.warn(`Warning: could not derive an npub from ${configPath}: ${error}`);
+      const decoded = /^[a-f0-9]{64}$/i.test(config.nsec)
+          ? { type: "nsec", data: Uint8Array.from(Buffer.from(config.nsec, "hex")) }
+          : nip19.decode(config.nsec);
+      if (decoded.type !== "nsec") throw new Error("Invalid key type");
+      npub = nip19.npubEncode(getPublicKey(decoded.data));
+  } catch {
+      console.error("Cannot seed admin: invalid routstrd private key in config.json.");
+      process.exit(1);
   }
-' "${ROUTSTRD_CONFIG}" "${AUTH_URL}"
+  await Bun.write(configPath, JSON.stringify(config, null, 2) + "\n");
+  console.log(npub);
+' "${ROUTSTRD_CONFIG}" "${AUTH_URL}")
 
-# Seed the container's own identity as admin (see cloudron/start.sh for the
-# rationale): the bundled CLI signs with this nsec, so `routstrd npubs add`
-# works from a shell in the container with nothing to copy.
-CONTAINER_NPUB=""
-if [ -s /tmp/routstrd-container-npub ]; then
-    CONTAINER_NPUB=$(tr -d '\n' < /tmp/routstrd-container-npub)
-    rm -f /tmp/routstrd-container-npub
-fi
-
-if [ -n "$CONTAINER_NPUB" ]; then
-    case ",${ROUTSTRD_AUTH_ADMIN_NPUBS}," in
-        *",${CONTAINER_NPUB},"*) ;;
-        *)
-            if [ -n "$ROUTSTRD_AUTH_ADMIN_NPUBS" ]; then
-                ROUTSTRD_AUTH_ADMIN_NPUBS="${CONTAINER_NPUB},${ROUTSTRD_AUTH_ADMIN_NPUBS}"
-            else
-                ROUTSTRD_AUTH_ADMIN_NPUBS="${CONTAINER_NPUB}"
-            fi
-            ;;
-    esac
-    export ROUTSTRD_AUTH_ADMIN_NPUBS
-    echo "The container's Nostr identity is an admin: ${CONTAINER_NPUB}"
-fi
+# Apply the container identity alongside any operator-configured admins.
+ROUTSTRD_AUTH_ADMIN_NPUBS="${CONTAINER_NPUB}${ROUTSTRD_AUTH_ADMIN_NPUBS:+,${ROUTSTRD_AUTH_ADMIN_NPUBS}}"
+export ROUTSTRD_AUTH_ADMIN_NPUBS
+echo "The container's Nostr identity is an admin: ${CONTAINER_NPUB}"
 
 _term() {
   echo "Shutting down..."
