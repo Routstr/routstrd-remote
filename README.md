@@ -260,29 +260,19 @@ bun run src/index.ts start -p 8080
 bun run src/index.ts start -d /path/to/routstr.db
 ```
 
-### NIP-98 client helper
+### Manage clients with routstrd
 
-`src/nip98-client.ts` signs each request with a Nostr private key and can add a client through `/clients/add`, then fetch `/clients` and print the current list.
-
-The private key must belong to one of the configured admin pubkeys (`ROUTSTRD_AUTH_ADMIN_NPUBS`, `ROUTSTRD_AUTH_ADMIN_PUBKEYS`, or an admin added through `POST /npubs`) because `/clients/add` is admin-only.
+Use the `routstrd` CLI to add and list clients through the auth proxy:
 
 ```bash
-# Add a client, then list all clients
-bun run client -- \
-  --url http://localhost:8008 \
-  --key nsec1... \
-  --name "My Laptop"
-
-# Or use env vars
-export ROUTSTRD_AUTH_URL=http://localhost:8008
-export NOSTR_NSEC=nsec1...
-bun run client -- --name "My Laptop"
-
-# Just list clients
-bun run client -- --json
+routstrd remote https://your-app.example.com
+routstrd clients add --name "My Laptop"
+routstrd clients list
 ```
 
-The helper creates `Authorization: Nostr <base64-event>` headers whose signed event binds the exact URL, HTTP method, and POST body hash, matching the validation in `src/nip98.ts`.
+`routstrd remote` prints your npub. If it isn't registered yet, ask an admin to add it before running the client commands. Registered members can add and list their own clients; admin access isn't required.
+
+The CLI signs requests automatically with its configured Nostr identity. This proxy validates the NIP-98 signatures in `src/nip98.ts`.
 
 ## Running alongside routstrd
 
