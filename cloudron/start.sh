@@ -81,7 +81,44 @@ bun -e '
     }
 
     await Bun.write(configPath, JSON.stringify(config, null, 2) + "\n");
+
+    // Hand the npub of this identity to the shell so it can be seeded as admin.
+    // A malformed nsec is a problem for the daemon to report; do not block startup.
+    try {
+        const decoded = nip19.decode(config.nsec);
+        await Bun.write("/tmp/routstrd-container-npub", nip19.npubEncode(getPublicKey(decoded.data)) + "\n");
+    } catch (error) {
+        console.warn(`==> Warning: could not derive an npub from ${configPath}: ${error}`);
+    }
 ' "${ROUTSTRD_CONFIG}" "${AUTH_URL}"
+
+# The container's own Nostr identity is the first admin.
+#
+# routstrd already holds this nsec and signs NIP-98 with it, so the bundled CLI
+# is an admin out of the box: `routstrd npubs add` works from the app's terminal
+# with nothing to copy, and stats/balances are the same identity. Seeding it
+# here means the npub table is never empty, so the anonymous first-admin claim
+# path (and its one-time token) is never reachable on a normal install.
+#
+# ROUTSTRD_AUTH_ADMIN_NPUBS is the proxy's own env-admin list: it is applied at
+# proxy start (AuthStore.reconcileEnvAdminPubkeys), which is also why this works
+# before routstr.db exists. An operator-supplied value is kept and unioned.
+CONTAINER_NPUB=""
+if [[ -s /tmp/routstrd-container-npub ]]; then
+    CONTAINER_NPUB="$(tr -d '\n' < /tmp/routstrd-container-npub)"
+    rm -f /tmp/routstrd-container-npub
+fi
+
+if [[ -n "${CONTAINER_NPUB}" ]]; then
+    : "${ROUTSTRD_AUTH_ADMIN_NPUBS:=}"
+    case ",${ROUTSTRD_AUTH_ADMIN_NPUBS}," in
+        *",${CONTAINER_NPUB},"*) ;;
+        *) ROUTSTRD_AUTH_ADMIN_NPUBS="${CONTAINER_NPUB}${ROUTSTRD_AUTH_ADMIN_NPUBS:+,${ROUTSTRD_AUTH_ADMIN_NPUBS}}" ;;
+    esac
+    export ROUTSTRD_AUTH_ADMIN_NPUBS
+    echo "==> Container Nostr identity is an admin: ${CONTAINER_NPUB}"
+    echo "    Add a person with: routstrd npubs add <their npub> --role admin --name \"Their Name\""
+fi
 
 # The bun step above runs as root and Bun.write() creates ${ROUTSTRD_DIR} (and
 # $HOME/.bun) as root, but the daemon runs as cloudron and must be able to
