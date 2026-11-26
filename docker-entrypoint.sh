@@ -13,9 +13,9 @@ ROUTSTRD_PORT="${ROUTSTRD_PORT:-${PORT:-8008}}"
 ROUTSTRD_AUTH_PORT="${ROUTSTRD_AUTH_PORT:-8080}"
 ROUTSTRD_AUTH_HOST="${ROUTSTRD_AUTH_HOST:-0.0.0.0}"
 ROUTSTRD_UPSTREAM="${ROUTSTRD_UPSTREAM:-http://localhost:${ROUTSTRD_PORT}}"
-# No default admin npub: unset leaves the npubs table empty, and the first admin
-# is then claimed with the one-time bootstrap token (generated and logged at
-# startup, or supplied here). An unauthenticated POST /npubs is never accepted.
+# The container's own Nostr identity is seeded as the first admin below, so the
+# npubs table is never empty and the anonymous first-admin claim path is never
+# reachable. ROUTSTRD_AUTH_ADMIN_NPUBS still adds extra admins when set.
 ROUTSTRD_AUTH_ADMIN_NPUBS="${ROUTSTRD_AUTH_ADMIN_NPUBS:-}"
 ROUTSTRD_AUTH_BOOTSTRAP_TOKEN="${ROUTSTRD_AUTH_BOOTSTRAP_TOKEN:-}"
 export ROUTSTRD_AUTH_PORT ROUTSTRD_AUTH_HOST ROUTSTRD_UPSTREAM
@@ -25,7 +25,7 @@ export ROUTSTRD_AUTH_ADMIN_NPUBS ROUTSTRD_AUTH_BOOTSTRAP_TOKEN
 ROUTSTRD_CONFIG="${ROUTSTRD_DIR}/config.json"
 AUTH_URL="http://localhost:${ROUTSTRD_AUTH_PORT}"
 echo "Configuring authUrl (${AUTH_URL}) and Nostr identity in ${ROUTSTRD_CONFIG}..."
-bun -e '
+CONTAINER_NPUB=$(bun -e '
   let nostrTools;
   try {
     nostrTools = await import("nostr-tools");
@@ -49,15 +49,26 @@ bun -e '
 
   config.authUrl = authUrl;
 
-  if (!config.nsec) {
-    const sk = generateSecretKey();
-    config.nsec = nip19.nsecEncode(sk);
-    const npub = nip19.npubEncode(getPublicKey(sk));
-    console.log(`Generated container Nostr identity: ${npub}`);
+  if (!config.nsec) config.nsec = nip19.nsecEncode(generateSecretKey());
+  let npub;
+  try {
+      const decoded = /^[a-f0-9]{64}$/i.test(config.nsec)
+          ? { type: "nsec", data: Uint8Array.from(Buffer.from(config.nsec, "hex")) }
+          : nip19.decode(config.nsec);
+      if (decoded.type !== "nsec") throw new Error("Invalid key type");
+      npub = nip19.npubEncode(getPublicKey(decoded.data));
+  } catch {
+      console.error("Cannot seed admin: invalid routstrd private key in config.json.");
+      process.exit(1);
   }
-
   await Bun.write(configPath, JSON.stringify(config, null, 2) + "\n");
-' "${ROUTSTRD_CONFIG}" "${AUTH_URL}"
+  console.log(npub);
+' "${ROUTSTRD_CONFIG}" "${AUTH_URL}")
+
+# Apply the container identity alongside any operator-configured admins.
+ROUTSTRD_AUTH_ADMIN_NPUBS="${CONTAINER_NPUB}${ROUTSTRD_AUTH_ADMIN_NPUBS:+,${ROUTSTRD_AUTH_ADMIN_NPUBS}}"
+export ROUTSTRD_AUTH_ADMIN_NPUBS
+echo "The container's Nostr identity is an admin: ${CONTAINER_NPUB}"
 
 _term() {
   echo "Shutting down..."

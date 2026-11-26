@@ -47,9 +47,10 @@ fi
 
 # Ensure routstrd's config.json has authUrl pointing to the auth proxy and a Nostr identity.
 ROUTSTRD_CONFIG="${ROUTSTRD_DIR}/config.json"
-AUTH_URL="http://localhost:${ROUTSTRD_AUTH_PORT}"
+# Match the origin the proxy requires for NIP-98 signatures.
+AUTH_URL="${ROUTSTRD_AUTH_PUBLIC_URL:-${CLOUDRON_APP_ORIGIN:-http://localhost:${ROUTSTRD_AUTH_PORT}}}"
 echo "==> Configuring authUrl (${AUTH_URL}) and Nostr identity in ${ROUTSTRD_CONFIG}..."
-bun -e '
+CONTAINER_NPUB=$(bun -e '
     let nostrTools;
     try {
         nostrTools = await import("nostr-tools");
@@ -73,15 +74,27 @@ bun -e '
 
     config.authUrl = authUrl;
 
-    if (!config.nsec) {
-        const sk = generateSecretKey();
-        config.nsec = nip19.nsecEncode(sk);
-        const npub = nip19.npubEncode(getPublicKey(sk));
-        console.log(`==> Generated container Nostr identity: ${npub}`);
+    if (!config.nsec) config.nsec = nip19.nsecEncode(generateSecretKey());
+    let npub;
+    try {
+        const decoded = /^[a-f0-9]{64}$/i.test(config.nsec)
+            ? { type: "nsec", data: Uint8Array.from(Buffer.from(config.nsec, "hex")) }
+            : nip19.decode(config.nsec);
+        if (decoded.type !== "nsec") throw new Error("Invalid key type");
+        npub = nip19.npubEncode(getPublicKey(decoded.data));
+    } catch {
+        console.error("Cannot seed admin: invalid routstrd private key in config.json.");
+        process.exit(1);
     }
-
     await Bun.write(configPath, JSON.stringify(config, null, 2) + "\n");
-' "${ROUTSTRD_CONFIG}" "${AUTH_URL}"
+    console.log(npub);
+' "${ROUTSTRD_CONFIG}" "${AUTH_URL}")
+
+# Apply the container identity alongside any operator-configured admins.
+ROUTSTRD_AUTH_ADMIN_NPUBS="${CONTAINER_NPUB}${ROUTSTRD_AUTH_ADMIN_NPUBS:+,${ROUTSTRD_AUTH_ADMIN_NPUBS}}"
+export ROUTSTRD_AUTH_ADMIN_NPUBS
+echo "==> Container Nostr identity is an admin: ${CONTAINER_NPUB}"
+echo "    Add a person with: routstrd npubs add <their npub> --role admin --name \"Their Name\""
 
 # The bun step above runs as root and Bun.write() creates ${ROUTSTRD_DIR} (and
 # $HOME/.bun) as root, but the daemon runs as cloudron and must be able to
